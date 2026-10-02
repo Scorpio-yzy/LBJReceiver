@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    USB 过滤表：插上这些型号的电视棒 / SDR 时，系统会问"是否用本应用打开"。
+    我们的 UsbDelegate 收到这个事件后，会把 App 拉起来并自动开始接收
+    （仅当用户启用了「使用内置驱动」时才自动；否则不抢外部驱动 App）。
+
+    ★ 这张表必须与 rtlsdr 模块的 rtl_sdr_device_filter.xml 保持一致：
+      那张是给【驱动自己】枚举设备用的，这张是给【系统】判断"插的设备我们认不认"用的。
+      两张不同步就会出现"驱动能枚举到、插入时却不提示"的怪事。
+
+    ★ 属性一律写成【十进制】：系统解析 device_filter 走资源 int 解析，十进制最稳。
+-->
+<resources>
+    <usb-device vendor-id="3034" product-id="10290" />  <!-- Generic RTL2832U -->
+    <usb-device vendor-id="3034" product-id="10296" />  <!-- Generic RTL2832U OEM -->
+    <usb-device vendor-id="1043" product-id="26240" />  <!-- DigitalNow Quad DVB-T PCI-E card -->
+    <usb-device vendor-id="1043" product-id="28431" />  <!-- Leadtek WinFast DTV Dongle mini D -->
+    <usb-device vendor-id="1112" product-id="28799" />  <!-- Genius TVGo DVB-T03 USB dongle (Ver. B) -->
+    <usb-device vendor-id="3277" product-id="169" />  <!-- Terratec Cinergy T Stick Black (rev 1) -->
+    <usb-device vendor-id="3277" product-id="179" />  <!-- Terratec NOXON DAB/DAB+ USB dongle (rev 1) -->
+    <usb-device vendor-id="3277" product-id="180" />  <!-- Terratec Deutschlandradio DAB Stick -->
+    <usb-device vendor-id="3277" product-id="181" />  <!-- Terratec NOXON DAB Stick - Radio Energy -->
+    <usb-device vendor-id="3277" product-id="183" />  <!-- Terratec Media Broadcast DAB Stick -->
+    <usb-device vendor-id="3277" product-id="184" />  <!-- Terratec BR DAB Stick -->
+    <usb-device vendor-id="3277" product-id="185" />  <!-- Terratec WDR DAB Stick -->
+    <usb-device vendor-id="3277" product-id="192" />  <!-- Terratec MuellerVerlag DAB Stick -->
+    <usb-device vendor-id="3277" product-id="198" />  <!-- Terratec Fraunhofer DAB Stick -->
+    <usb-device vendor-id="3277" product-id="211" />  <!-- Terratec Cinergy T Stick RC (Rev.3) -->
+    <usb-device vendor-id="3277" product-id="215" />  <!-- Terratec T Stick PLUS -->
+    <usb-device vendor-id="3277" product-id="224" />  <!-- Terratec NOXON DAB/DAB+ USB dongle (rev 2) -->
+    <usb-device vendor-id="5460" product-id="20512" />  <!-- PixelView PV-DT235U(RN) -->
+    <usb-device vendor-id="5620" product-id="305" />  <!-- Astrometa DVB-T/DVB-T2 -->
+    <usb-device vendor-id="5620" product-id="307" />  <!-- HanfTek DAB+FM+DVB-T -->
+    <usb-device vendor-id="6235" product-id="1568" />  <!-- Compro Videomate U620F -->
+    <usb-device vendor-id="6235" product-id="1616" />  <!-- Compro Videomate U650F -->
+    <usb-device vendor-id="6235" product-id="1664" />  <!-- Compro Videomate U680F -->
+    <usb-device vendor-id="7040" product-id="54163" />  <!-- GIGABYTE GT-U7300 -->
+    <usb-device vendor-id="7040" product-id="54164" />  <!-- DIKOM USB-DVBT HD -->
+    <usb-device vendor-id="7040" product-id="54165" />  <!-- Peak 102569AGPK -->
+    <usb-device vendor-id="7040" product-id="54167" />  <!-- KWorld KW-UB450-T USB DVB-T Pico TV -->
+    <usb-device vendor-id="7040" product-id="54168" />  <!-- Zaapa ZT-MINDVBZP -->
+    <usb-device vendor-id="7040" product-id="54173" />  <!-- SVEON STV20 DVB-T USB & FM -->
+    <usb-device vendor-id="7040" product-id="54180" />  <!-- Twintech UT-40 -->
+    <usb-device vendor-id="7040" product-id="54184" />  <!-- ASUS U3100MINI_PLUS_V2 -->
+    <usb-device vendor-id="7040" product-id="54191" />  <!-- SVEON STV27 DVB-T USB & FM -->
+    <usb-device vendor-id="7040" product-id="54192" />  <!-- SVEON STV21 DVB-T USB & FM -->
+    <usb-device vendor-id="7449" product-id="4353" />  <!-- Dexatek DK DVB-T Dongle (Logilink VG0002A) -->
+    <usb-device vendor-id="7449" product-id="4354" />  <!-- Dexatek DK DVB-T Dongle (MSI DigiVox mini II V3.0) -->
+    <usb-device vendor-id="7449" product-id="4355" />  <!-- Dexatek Technology Ltd. DK 5217 DVB-T Dongle -->
+    <usb-device vendor-id="7449" product-id="4356" />  <!-- MSI DigiVox Micro HD -->
+    <usb-device vendor-id="8013" product-id="43011" />  <!-- Sweex DVB-T USB -->
+    <usb-device vendor-id="8013" product-id="47107" />  <!-- GTek T803 -->
+    <usb-device vendor-id="8013" product-id="51203" />  <!-- Lifeview LV5TDeluxe -->
+    <usb-device vendor-id="8013" product-id="53894" />  <!-- MyGica TD312 -->
+    <usb-device vendor-id="8013" product-id="55299" />  <!-- PROlectrix DV107669 -->
+</resources>

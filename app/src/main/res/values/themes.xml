@@ -1,0 +1,74 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!--
+      ★ 这里必须是【纯深色】主题，不能用 DayNight。
+
+      踩过的坑：原来写的是 Theme.MaterialComponents.DayNight.NoActionBar。
+      手机处于浅色模式时，DayNight 会切到浅色分支，于是对话框变成【白底】；
+      而 android:textColorPrimary 是给黑底设计的 @color/text（#E6EDF3，接近纯白），
+      结果就是白底上写白字 —— 提示框几乎看不清。实测用户直接反馈"文字太淡"。
+
+      本 App 的界面本来就是深色的（windowBackground=@color/bg），
+      所以直接把主题锁死成深色，对话框自然也跟着深色，与主界面一致。
+    -->
+    <style name="Theme.Lbj" parent="Theme.MaterialComponents.NoActionBar">
+        <item name="colorPrimary">@color/accent</item>
+        <item name="colorPrimaryDark">@color/bg</item>
+        <item name="colorAccent">@color/accent</item>
+        <item name="android:windowBackground">@color/bg</item>
+        <item name="android:textColorPrimary">@color/text</item>
+        <item name="android:textColorSecondary">@color/dim</item>
+        <item name="android:statusBarColor" tools:targetApi="l">@color/bg</item>
+        <!-- 所有 AlertDialog 都走这套配色，不再依赖系统日夜模式 -->
+        <item name="alertDialogTheme">@style/Theme.Lbj.Dialog</item>
+        <item name="materialAlertDialogTheme">@style/Theme.Lbj.Dialog</item>
+    </style>
+
+    <!--
+        收音机里的小按钮统一样式。
+        ★ 关键是 maxLines=1 + includeFontPadding=false + 统一 minHeight：
+          之前"步进 12.50 kHz"会折成两行，那一排就被撑高，
+          旁边的按钮看着上下错位（用户直接指出过）。
+    -->
+    <style name="RadioBtn" parent="Widget.AppCompat.Button">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:minWidth">0dp</item>
+        <item name="android:minHeight">44dp</item>
+        <item name="android:paddingLeft">4dp</item>
+        <item name="android:paddingRight">4dp</item>
+        <item name="android:maxLines">1</item>
+        <item name="android:ellipsize">end</item>
+        <!-- 按钮默认会把文字转大写，于是"kHz"变成"KHZ"。这里关掉。 -->
+        <item name="android:textAllCaps">false</item>
+        <item name="android:textSize">14sp</item>
+        <item name="android:gravity">center</item>
+        <item name="android:includeFontPadding">false</item>
+    </style>
+
+    <!-- 自制数字键盘：一行三个键 -->
+    <style name="KpRow">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:orientation">horizontal</item>
+    </style>
+
+    <style name="KpKey" parent="RadioBtn">
+        <item name="android:layout_width">0dp</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_weight">1</item>
+        <item name="android:layout_margin">2dp</item>
+        <item name="android:minHeight">48dp</item>
+        <item name="android:textSize">20sp</item>
+    </style>
+
+    <!-- 对话框：深色底 + 高对比文字。标题用亮色，正文用次要色但仍要清晰可读。 -->
+    <style name="Theme.Lbj.Dialog" parent="Theme.MaterialComponents.Dialog.Alert">
+        <item name="colorPrimary">@color/accent</item>
+        <item name="colorAccent">@color/accent</item>
+        <item name="colorBackgroundFloating">@color/panel</item>
+        <item name="android:textColorPrimary">@color/text</item>
+        <item name="android:textColorSecondary">@color/text</item>
+        <item name="android:textColorTertiary">@color/dim</item>
+        <item name="android:windowBackground">@color/panel</item>
+    </style>
+</resources>

@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- 后台/锁屏继续收音：必须靠前台服务，否则 MIUI 会随时冻结进程 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- 用于发现 RTL-SDR 驱动 App（iqsrc:// 协议） -->
+    <queries>
+        <package android:name="marto.rtl_tcp_andro" />
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="iqsrc" />
+        </intent>
+    </queries>
+
+    <application
+        android:name="com.chaquo.python.android.PyApplication"
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Lbj">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:launchMode="singleTop"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|screenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+            收音机/预警器运行期间常驻的前台服务。
+            前台服务是"锁屏后还能继续出声"的唯一可靠做法：
+            没有它，进程只是碰巧还活着，MIUI 的省电策略随时会冻结或杀掉它。
+        -->
+        <service
+            android:name=".EngineService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+
+        <!--
+            内置 rtl_tcp 驱动（合并进来的）。
+            插上电视棒时由系统按 device_filter 匹配，把 attach 广播发给 UsbDelegate，
+            由它拿到授权后再拉起 BinaryRunnerService。
+        -->
+        <service
+            android:name="com.sdrtouch.rtlsdr.BinaryRunnerService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+
+        <activity
+            android:name="com.sdrtouch.rtlsdr.UsbDelegate"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/device_filter" />
+        </activity>
+    </application>
+</manifest>

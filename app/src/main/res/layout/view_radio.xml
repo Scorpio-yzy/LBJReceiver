@@ -1,0 +1,389 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    收音机 / 对讲接收界面。
+
+    排版上踩过的坑（都已修）：
+      · 按钮文字太长会折行，把那一排撑高，旁边按钮看着"上下错位" ——
+        所有按钮统一 RadioBtn 样式（maxLines=1 / 统一 minHeight / 居中），文字用短写法。
+      · 状态行原来塞了"步进"，太长会折行 —— 步进挪到加减中间，这里不再重复。
+      · 频率原来用系统输入法，光标不可见、看不清改到哪一位 ——
+        改成自己的数字键盘（只 0-9 / 小数点 / 退格），输入内容就显示在大字上，所见即所得。
+-->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/radioRoot"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/bg"
+    android:fillViewport="true"
+    android:visibility="gone">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="12dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/radio_title"
+                android:textColor="@color/accent"
+                android:textSize="16sp"
+                android:textStyle="bold" />
+
+            <!-- 规格与右上角「收音机」按钮完全一致（不用 RadioBtn 样式）：
+                 收音机那边是 wrap_content + minWidth 0 + 左右 12dp + 13sp，
+                 这里如果套 RadioBtn（minHeight 44dp / 左右 4dp / 14sp），
+                 两个按钮大小就不一样。 -->
+            <Button
+                android:id="@+id/btnBackToLbj"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:minWidth="0dp"
+                android:paddingLeft="12dp"
+                android:paddingRight="12dp"
+                android:textSize="13sp"
+                android:text="@string/radio_back" />
+        </LinearLayout>
+
+        <!-- 当前模式：放在最显眼的位置，字号比下面的频率小一点 -->
+        <TextView
+            android:id="@+id/tvTopMode"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:gravity="center"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:text="@string/mode_channel"
+            android:textColor="@color/accent"
+            android:textSize="22sp"
+            android:textStyle="bold" />
+
+        <!-- 频率 + MHz 同一行 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:orientation="horizontal"
+            android:gravity="center">
+
+            <TextView
+                android:id="@+id/tvFreq"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:minWidth="205dp"
+                android:fontFamily="monospace"
+                android:gravity="center"
+                android:maxLines="1"
+                android:text="457.0000"
+                android:textColor="@color/text"
+                android:textSize="40sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="6dp"
+                android:text="@string/radio_mhz_short"
+                android:textColor="@color/dim"
+                android:textSize="15sp" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/tvFreqUnit"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:maxLines="1"
+            android:text="@string/radio_range"
+            android:textColor="@color/dim"
+            android:textSize="11sp" />
+
+        <TextView
+            android:id="@+id/tvRadioStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:gravity="center"
+            android:fontFamily="monospace"
+            android:maxLines="1"
+            android:textSize="13sp"
+            android:textColor="@color/accent"
+            android:text="--" />
+
+        <!--
+            自制数字键盘：只在频率模式、且点了频率之后出现。
+            10 个数字 + 小数点 + 退格 + 取消/确定，不调用系统输入法。
+        -->
+        <LinearLayout
+            android:id="@+id/keypad"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:orientation="vertical"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/tvKeypadTip"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center"
+                android:text="@string/kp_tip"
+                android:textColor="@color/warn"
+                android:textSize="12sp" />
+
+            <LinearLayout style="@style/KpRow">
+                <Button android:id="@+id/kp1" style="@style/KpKey" android:text="1" />
+                <Button android:id="@+id/kp2" style="@style/KpKey" android:text="2" />
+                <Button android:id="@+id/kp3" style="@style/KpKey" android:text="3" />
+            </LinearLayout>
+
+            <LinearLayout style="@style/KpRow">
+                <Button android:id="@+id/kp4" style="@style/KpKey" android:text="4" />
+                <Button android:id="@+id/kp5" style="@style/KpKey" android:text="5" />
+                <Button android:id="@+id/kp6" style="@style/KpKey" android:text="6" />
+            </LinearLayout>
+
+            <LinearLayout style="@style/KpRow">
+                <Button android:id="@+id/kp7" style="@style/KpKey" android:text="7" />
+                <Button android:id="@+id/kp8" style="@style/KpKey" android:text="8" />
+                <Button android:id="@+id/kp9" style="@style/KpKey" android:text="9" />
+            </LinearLayout>
+
+            <LinearLayout style="@style/KpRow">
+                <Button android:id="@+id/kpDot" style="@style/KpKey" android:text="." />
+                <Button android:id="@+id/kp0" style="@style/KpKey" android:text="0" />
+                <Button android:id="@+id/kpDel" style="@style/KpKey" android:text="@string/kp_del" />
+            </LinearLayout>
+
+            <LinearLayout style="@style/KpRow">
+                <Button android:id="@+id/kpCancel" style="@style/KpKey" android:text="@string/kp_cancel" />
+                <Button android:id="@+id/kpClear" style="@style/KpKey" android:text="@string/kp_clear" />
+                <Button android:id="@+id/kpOk" style="@style/KpKey" android:text="@string/kp_ok" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- 第一排：减 / 步进 / 加（步进夹在加减中间） -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <Button
+                android:id="@+id/btnDown"
+                style="@style/RadioBtn"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:textSize="18sp"
+                android:text="@string/radio_down" />
+
+            <Button
+                android:id="@+id/btnStep"
+                style="@style/RadioBtn"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1.3"
+                android:layout_marginStart="8dp"
+                android:text="@string/radio_step_short" />
+
+            <Button
+                android:id="@+id/btnUp"
+                style="@style/RadioBtn"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:layout_marginStart="8dp"
+                android:textSize="18sp"
+                android:text="@string/radio_up" />
+        </LinearLayout>
+
+        <!-- 第二排：制式 / 亚音 / 自动扫描（信道模式下这三个都不可用） -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <Button
+                android:id="@+id/btnMode"
+                style="@style/RadioBtn"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/radio_mode" />
+
+            <Button
+                android:id="@+id/btnCtcss"
+                style="@style/RadioBtn"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:layout_marginStart="6dp"
+                android:text="@string/radio_ctcss" />
+
+            <Button
+                android:id="@+id/btnScan"
+                style="@style/RadioBtn"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:layout_marginStart="6dp"
+                android:text="@string/radio_scan" />
+        </LinearLayout>
+
+        <!-- 信道栏 -->
+        <TextView
+            android:id="@+id/tvChannel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:background="@color/panel"
+            android:padding="8dp"
+            android:fontFamily="monospace"
+            android:maxLines="2"
+            android:text="@string/mode_channel"
+            android:textColor="@color/accent"
+            android:textSize="12sp" />
+
+        <!-- 模式切换：做大一点，只说"切换模式" -->
+        <Button
+            android:id="@+id/btnVfo"
+            style="@style/RadioBtn"
+            android:layout_width="match_parent"
+            android:layout_marginTop="8dp"
+            android:minHeight="52dp"
+            android:textSize="17sp"
+            android:text="@string/switch_mode" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <Button
+                android:id="@+id/btnChPrev"
+                style="@style/RadioBtn"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/ch_prev" />
+
+            <Button
+                android:id="@+id/btnChList"
+                style="@style/RadioBtn"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1.3"
+                android:layout_marginStart="6dp"
+                android:text="@string/ch_list" />
+
+            <Button
+                android:id="@+id/btnChNext"
+                style="@style/RadioBtn"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:layout_marginStart="6dp"
+                android:text="@string/ch_next" />
+
+            <Button
+                android:id="@+id/btnChEdit"
+                style="@style/RadioBtn"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="0.9"
+                android:layout_marginStart="6dp"
+                android:text="@string/ch_edit" />
+        </LinearLayout>
+
+        <!-- 频谱：与预警器同一个控件 -->
+        <com.railfan.lbj.SpectrumView
+            android:id="@+id/spectrumRadio"
+            android:layout_width="match_parent"
+            android:layout_height="76dp"
+            android:layout_marginTop="10dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/radio_squelch"
+                android:textColor="@color/text"
+                android:textSize="13sp" />
+
+            <CheckBox
+                android:id="@+id/chkSquelch"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="4dp"
+                android:checked="true"
+                android:maxLines="1"
+                android:text="@string/radio_squelch_on"
+                android:textColor="@color/text"
+                android:textSize="13sp" />
+
+            <TextView
+                android:id="@+id/tvSquelchVal"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:gravity="end"
+                android:fontFamily="monospace"
+                android:maxLines="1"
+                android:text="+12 dB"
+                android:textColor="@color/dim"
+                android:textSize="13sp" />
+        </LinearLayout>
+
+        <SeekBar
+            android:id="@+id/seekSquelch"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:max="100"
+            android:progress="30" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="@string/radio_volume"
+            android:textColor="@color/text"
+            android:textSize="13sp" />
+
+        <SeekBar
+            android:id="@+id/seekVolume"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:max="100"
+            android:progress="80" />
+
+        <TextView
+            android:id="@+id/tvRadioHint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:textColor="@color/dim"
+            android:textSize="12sp"
+            android:text="@string/radio_hint" />
+    </LinearLayout>
+</ScrollView>

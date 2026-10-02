@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 信道列表的一行：编号 + 名称 + 频率/制式/亚音 -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="horizontal"
+    android:gravity="center_vertical"
+    android:paddingStart="16dp"
+    android:paddingEnd="16dp"
+    android:paddingTop="8dp"
+    android:paddingBottom="8dp">
+
+    <TextView
+        android:id="@+id/chIndex"
+        android:layout_width="34dp"
+        android:layout_height="wrap_content"
+        android:fontFamily="monospace"
+        android:textColor="@color/dim"
+        android:textSize="13sp"
+        android:text="01" />
+
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:orientation="vertical">
+
+        <TextView
+            android:id="@+id/chName"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="@color/text"
+            android:textSize="16sp"
+            android:text="信道" />
+
+        <TextView
+            android:id="@+id/chInfo"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textColor="@color/dim"
+            android:textSize="12sp"
+            android:text="457.0000 MHz  NFM" />
+    </LinearLayout>
+</LinearLayout>

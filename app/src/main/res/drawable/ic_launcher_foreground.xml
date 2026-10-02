@@ -1,0 +1,32 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 车体 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M42,38 L66,38 A7,7 0 0 1 73,45 L73,62 A7,7 0 0 1 66,69 L42,69 A7,7 0 0 1 35,62 L35,45 A7,7 0 0 1 42,38 Z" />
+    <!-- 车窗 -->
+    <path
+        android:fillColor="#0D47A1"
+        android:pathData="M41,44 L67,44 L67,53 L41,53 Z" />
+    <!-- 车轮 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M44,75 m-4,0 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M64,75 m-4,0 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0" />
+    <!-- 天线波 -->
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3"
+        android:fillColor="#00000000"
+        android:pathData="M47,32 A9,9 0 0 1 61,32" />
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3"
+        android:fillColor="#00000000"
+        android:pathData="M41,25 A17,17 0 0 1 67,25" />
+</vector>

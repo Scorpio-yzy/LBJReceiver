@@ -1,0 +1,26 @@
+# ---------- 构建产物 ----------
+.gradle/
+**/.gradle/
+build/
+*/build/
+**/.cxx/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# ---------- 本机配置与签名密钥（★ 绝不能提交）----------
+keystore.properties
+local.properties
+*.jks
+*.keystore
+*.p12
+
+# ---------- 开发资料（一律不入库）----------
+# 截图 / adb 自动化脚本 / 模拟信号源 / 日志 / 桌面测试套件
+tools/
+
+# ---------- IDE / 系统 ----------
+.idea/
+*.iml
+.DS_Store
+Thumbs.db

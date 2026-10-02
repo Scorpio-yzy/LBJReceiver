@@ -1,0 +1,257 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    一屏两用：mainRoot 是列车预警器，radioRoot（view_radio.xml）是收音机。
+    两者互斥显示，由右上角的按钮切换（见 MainActivity.showRadio）。
+
+    放在同一个 FrameLayout 里而不是做成两个 Activity —— 切换时不用跨 Activity
+    传递 Python 引擎对象，也不会因为 Activity 重建把"保持连接"的状态弄丢。
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/bg">
+
+<ScrollView
+    android:id="@+id/mainRoot"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/bg"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="12dp">
+
+        <!-- 标题行 + 右上角的【收音机】入口 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <TextView
+                android:id="@+id/tvHeader"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:fontFamily="monospace"
+                android:textSize="12sp"
+                android:textColor="@color/warn"
+                android:text="--:--:--  关注:无" />
+
+            <Button
+                android:id="@+id/btnRadio"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:minWidth="0dp"
+                android:paddingLeft="12dp"
+                android:paddingRight="12dp"
+                android:textSize="13sp"
+                android:text="@string/radio_enter" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/tvWarning"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:background="@color/alarm"
+            android:padding="6dp"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:textColor="#FFFFFF"
+            android:visibility="gone"
+            android:text="" />
+
+        <TextView
+            android:id="@+id/tvTrain"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:gravity="center"
+            android:text="----"
+            android:textColor="@color/text"
+            android:textSize="46sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/tvCategory"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:text="等待信号..."
+            android:textColor="@color/accent"
+            android:textSize="15sp" />
+
+        <!-- 固定列宽的信息表格：标签与数值的横向位置在每行都一致，
+             不会因为数字位数变化而左右乱跳（在代码里动态生成行） -->
+        <LinearLayout
+            android:id="@+id/infoGrid"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:orientation="vertical" />
+
+        <com.railfan.lbj.SpectrumView
+            android:id="@+id/spectrum"
+            android:layout_width="match_parent"
+            android:layout_height="76dp"
+            android:layout_marginTop="8dp" />
+
+        <TextView
+            android:id="@+id/tvS1"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textSize="12sp"
+            android:textColor="#58A6FF"
+            android:text="▲ ---- MHz  G:-  P:-  S:-k" />
+
+        <TextView
+            android:id="@+id/tvS2"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textSize="12sp"
+            android:textColor="@color/dim"
+            android:text="RSSI:--- 阈:--- RX:OFF H:0" />
+
+        <TextView
+            android:id="@+id/tvS3"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textSize="12sp"
+            android:textColor="@color/dim"
+            android:text="FERR:+0 AFC:+0 S:0.00" />
+
+        <TextView
+            android:id="@+id/tvS4"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textSize="12sp"
+            android:textColor="#D58BFF"
+            android:text="PK:---.------M Δ:---.-k ---dB" />
+
+        <!-- 3 列 × 2 行：把按钮占的高度压到最低，"最近列车"才有地方显示。 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/btnStart"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:insetTop="6dp"
+                android:insetBottom="6dp"
+                android:minHeight="0dp"
+                android:paddingTop="6dp"
+                android:paddingBottom="6dp"
+                android:text="@string/start" />
+
+            <Button
+                android:id="@+id/btnStop"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="6dp"
+                android:layout_weight="1"
+                android:enabled="false"
+                android:insetTop="6dp"
+                android:insetBottom="6dp"
+                android:minHeight="0dp"
+                android:paddingTop="6dp"
+                android:paddingBottom="6dp"
+                android:text="@string/stop" />
+
+            <Button
+                android:id="@+id/btnSettings"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="6dp"
+                android:layout_weight="1"
+                android:insetTop="6dp"
+                android:insetBottom="6dp"
+                android:minHeight="0dp"
+                android:paddingTop="6dp"
+                android:paddingBottom="6dp"
+                android:text="@string/settings" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/btnKeyword"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:insetTop="6dp"
+                android:insetBottom="6dp"
+                android:minHeight="0dp"
+                android:paddingTop="6dp"
+                android:paddingBottom="6dp"
+                android:text="@string/keyword" />
+
+            <Button
+                android:id="@+id/btnClear"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="6dp"
+                android:layout_weight="1"
+                android:insetTop="6dp"
+                android:insetBottom="6dp"
+                android:minHeight="0dp"
+                android:paddingTop="6dp"
+                android:paddingBottom="6dp"
+                android:text="@string/clear" />
+
+            <Button
+                android:id="@+id/btnGps"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="6dp"
+                android:layout_weight="1"
+                android:insetTop="6dp"
+                android:insetBottom="6dp"
+                android:minHeight="0dp"
+                android:paddingTop="6dp"
+                android:paddingBottom="6dp"
+                android:text="@string/gps_locate" />
+        </LinearLayout>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/recent"
+            android:textColor="@color/dim"
+            android:textSize="12sp" />
+
+        <!--
+            "最近列车"表格。原来这里是一个 TextView，靠 String.format("%-7s") 补空格对齐，
+            但 Android 的 monospace 字体【没有中文字形】，"下行/上行/未知"会回退到按比例
+            排的中文字体，宽度不等于 ASCII 两倍 —— 于是每一行的列都会错开。
+            改成真正的表格（每格一个 TextView + layout_weight）后，对齐由布局系统保证，
+            和字体、字符宽度完全无关。表头与数据行都在代码里建。
+        -->
+        <LinearLayout
+            android:id="@+id/logTable"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:orientation="vertical" />
+    </LinearLayout>
+</ScrollView>
+
+<include layout="@layout/view_radio" />
+
+</FrameLayout>

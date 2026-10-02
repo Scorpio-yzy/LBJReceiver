@@ -1,0 +1,10 @@
+<resources>
+    <color name="ic_launcher_background">#0D47A1</color>
+    <color name="bg">#0E1116</color>
+    <color name="panel">#161B22</color>
+    <color name="accent">#2ECC71</color>
+    <color name="warn">#F1C40F</color>
+    <color name="alarm">#E74C3C</color>
+    <color name="text">#E6EDF3</color>
+    <color name="dim">#8B949E</color>
+</resources>

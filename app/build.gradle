@@ -1,0 +1,96 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'com.chaquo.python'
+}
+
+// ---------------------------------------------------------------------------
+// 本机配置与签名：都不进仓库
+//   · keystore.properties（密钥路径/密码）—— 见 keystore.properties.example
+//   · local.properties（SDK 路径、Chaquopy 用的本机 Python）
+//   别人克隆后没有这两个文件也能构建：
+//     没有 keystore.properties -> release 退回 debug 签名
+//     没有 buildPython        -> 交给 Chaquopy 自己找
+// ---------------------------------------------------------------------------
+def keystoreProps = new Properties()
+def keystorePropsFile = rootProject.file('keystore.properties')
+if (keystorePropsFile.exists()) {
+    keystorePropsFile.withInputStream { keystoreProps.load(it) }
+}
+def localProps = new Properties()
+def localPropsFile = rootProject.file('local.properties')
+if (localPropsFile.exists()) {
+    localPropsFile.withInputStream { localProps.load(it) }
+}
+def hasKeystore = keystoreProps.getProperty('storeFile') != null
+def buildPyPath = localProps.getProperty('buildPython')
+
+android {
+    namespace 'com.railfan.lbj'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.railfan.lbj"
+        minSdk 26
+        targetSdk 34
+        versionCode 18
+        versionName "2.4.3"
+        resourceConfigurations += ["zh", "en"]
+        // Chaquopy 17 的 Python 3.12 运行时只提供 arm64-v8a / x86_64；
+        // Android 8.0+ 的 32 位 ARM 设备极少，只打 arm64 可让 APK 减半。
+        ndk { abiFilters "arm64-v8a" }
+    }
+
+    signingConfigs {
+        release {
+            if (hasKeystore) {
+                storeFile rootProject.file(keystoreProps.getProperty('storeFile'))
+                storePassword keystoreProps.getProperty('storePassword')
+                keyAlias keystoreProps.getProperty('keyAlias')
+                keyPassword keystoreProps.getProperty('keyPassword')
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            // 有密钥就用正式签名；没有就退回 debug 签名（保证别人也能构建）
+            signingConfig hasKeystore ? signingConfigs.release : signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = '17' }
+    packaging { resources.excludes += ["META-INF/*"] }
+    lint { abortOnError false }
+}
+
+// ---------------------------------------------------------------------------
+// 嵌入 CPython 3.12 + numpy，直接跑 Sdr-Is-Fun 的原版 DSP / 协议代码
+// 只装 numpy：lbj_ref.py 用到的 3 个 scipy 函数由 lbj_engine.py 的兼容层提供，
+// 这样 APK 可以少 ~40 MB。
+// ---------------------------------------------------------------------------
+chaquopy {
+    defaultConfig {
+        version = "3.12"
+        // 本机 Python 路径放 local.properties（gitignore），不写死在这里
+        if (buildPyPath) {
+            buildPython(buildPyPath)
+        }
+        pip {
+            install("numpy")
+        }
+    }
+}
+
+dependencies {
+    implementation project(':rtlsdr')
+    implementation project(':sdrdrivertools')
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.11.0'
+    implementation 'androidx.core:core-ktx:1.12.0'
+}
