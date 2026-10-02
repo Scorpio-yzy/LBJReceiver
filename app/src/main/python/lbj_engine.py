@@ -1,4 +1,10 @@
 # -*- coding: utf-8 -*-
+# LBJ Receiver —— Android 端 铁路列车接近预警接收机
+# Copyright (C) 2026 Scorpio-yzy
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# 本文件是 LBJ Receiver 的一部分，以 GPL-3.0-or-later 发布；详见 LICENSE 与 THIRD_PARTY.md。
+
 """
 LBJ 接收机 —— Android 引擎（驱动层）
 

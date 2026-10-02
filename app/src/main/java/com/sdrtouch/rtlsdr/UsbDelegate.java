@@ -1,4 +1,12 @@
 /*
+ * ★ 修改说明（LBJ Receiver 项目添加）
+ *   本文件来自 Signalware Ltd 的 rtl_tcp_andro 模块，版权归其所有，适用下方原始许可。
+ *   本项目对它的改动：
+ *     · USB 插入时额外启动 com.railfan.lbj.MainActivity 并带 autostart extra
+ *       （上游只发广播，本项目里没有接收者，导致"插上棒不会自动开始接收"）
+ *   改动之外与上游一致。本项目整体以 GPL-3.0-or-later 发布，详见 LICENSE 与 THIRD_PARTY.md。
+ */
+/*
  * rtl_tcp_andro is a library that uses libusb and librtlsdr to
  * turn your Realtek RTL2832 based DVB dongle into a SDR receiver.
  * It independently implements the rtl-tcp API protocol for native Android usage.

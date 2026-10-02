@@ -11,6 +11,15 @@
 
 > ⚠ 仅用于**接收**公开无线电信号与学习 SDR/POCSAG 解码，禁止用于任何非法用途。
 
+## 界面
+
+| 列车预警接收 | 收音机 / 扫描器 | 设置 |
+|---|---|---|
+| <img src="docs/img/detector.png" width="250" alt="列车预警接收"> | <img src="docs/img/radio.png" width="250" alt="收音机"> | <img src="docs/img/settings.png" width="250" alt="设置"> |
+
+> 真机截图：左图 821.2375 MHz 接收中（频谱里那根黄柱是 RTL-SDR 的直流尖峰，属正常现象）；
+> 中图是收音机模式收到本地 FM 广播；右图是设置页。
+
 ## 环境要求
 
 | 项目 | 要求 |

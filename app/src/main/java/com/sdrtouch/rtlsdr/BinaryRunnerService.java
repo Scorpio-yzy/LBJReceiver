@@ -1,4 +1,13 @@
 /*
+ * ★ 修改说明（LBJ Receiver 项目添加）
+ *   本文件来自 Signalware Ltd 的 rtl_tcp_andro 模块，版权归其所有，适用下方原始许可。
+ *   本项目对它的改动：
+ *     · 新增 onDestroy() -> closeService()：服务销毁时释放连接，避免残留进程占着 1234
+ *     · 修 startWithDevice() 空队列分支：先 startForeground 再停自己，
+ *       否则触发 ForegroundServiceDidNotStartInTimeException（绑定时调 startForegroundService 的坑）
+ *   改动之外与上游一致。本项目整体以 GPL-3.0-or-later 发布，详见 LICENSE 与 THIRD_PARTY.md。
+ */
+/*
  * rtl_tcp_andro is a library that uses libusb and librtlsdr to
  * turn your Realtek RTL2832 based DVB dongle into a SDR receiver.
  * It independently implements the rtl-tcp API protocol for native Android usage.
