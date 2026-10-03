@@ -228,13 +228,47 @@
                 android:text="@string/gps_locate" />
         </LinearLayout>
 
-        <TextView
+        <!-- 标题 + 历史入口同一行：不动上面 6 颗按钮的布局，免得又踩排版坑 -->
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:text="@string/recent"
-            android:textColor="@color/dim"
-            android:textSize="12sp" />
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/recent"
+                android:textColor="@color/dim"
+                android:textSize="12sp" />
+
+            <CheckBox
+                android:id="@+id/chkVoice"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:minWidth="0dp"
+                android:paddingStart="0dp"
+                android:paddingEnd="10dp"
+                android:text="语音"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/btnHistory"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:insetTop="4dp"
+                android:insetBottom="4dp"
+                android:minHeight="0dp"
+                android:minWidth="0dp"
+                android:paddingStart="12dp"
+                android:paddingEnd="12dp"
+                android:paddingTop="4dp"
+                android:paddingBottom="4dp"
+                android:text="历史"
+                android:textSize="12sp" />
+        </LinearLayout>
 
         <!--
             "最近列车"表格。原来这里是一个 TextView，靠 String.format("%-7s") 补空格对齐，

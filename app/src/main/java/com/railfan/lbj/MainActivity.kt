@@ -27,6 +27,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.VibrationEffect
 import android.os.Vibrator
+import android.speech.tts.TextToSpeech
 import android.text.InputFilter
 import android.text.TextUtils
 import android.text.InputType
@@ -45,6 +46,7 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
@@ -55,9 +57,11 @@ import com.sdrtouch.rtlsdr.BuiltinDriver
 import com.sdrtouch.tools.StrRes
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.text.SimpleDateFormat
+import java.time.LocalDate
 import java.util.Date
 import java.util.Locale
 
@@ -134,6 +138,18 @@ private const val FULL_STOP_DELAY_MS = 120000L
     private lateinit var btnKeyword: Button
     private lateinit var btnClear: Button
     private lateinit var btnGps: Button
+    private lateinit var btnHistory: Button
+    private lateinit var chkVoice: CheckBox
+
+    // ---- 列车接收历史 ----
+    private var histDays: List<String> = emptyList()
+    private var histIdx = 0
+    private var histTrips: JSONArray = JSONArray()
+    private var histDialog: AlertDialog? = null
+    private var histStatus: TextView? = null
+    private var histAdapter: HistAdapter? = null
+    private var pendingHistFmt = "csv"
+    private var pendingHistScope = "all"
 
     // ------------------------------------------------------------ 收音机
     //
@@ -232,6 +248,11 @@ private const val FULL_STOP_DELAY_MS = 120000L
         btnKeyword = findViewById(R.id.btnKeyword)
         btnClear = findViewById(R.id.btnClear)
         btnGps = findViewById(R.id.btnGps)
+        btnHistory = findViewById(R.id.btnHistory)
+        chkVoice = findViewById(R.id.chkVoice)
+        chkVoice.isChecked = prefs.getBoolean("voice", false)
+        chkVoice.setOnCheckedChangeListener { _, on -> setVoiceEnabled(on) }
+        if (chkVoice.isChecked) setVoiceEnabled(true)      // 上次开着就把它唤起
 
         mainRoot = findViewById(R.id.mainRoot)
         radioRoot = findViewById(R.id.radioRoot)
@@ -306,6 +327,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
 
         btnStart.setOnClickListener { startEngine() }
         btnStop.setOnClickListener { stopEngine() }
+        btnHistory.setOnClickListener { showHistory() }
         btnSettings.setOnClickListener { showSettings() }
         btnKeyword.setOnClickListener { showKeywordDialog() }
         btnClear.setOnClickListener { callAsync("clear_dashboard") { toast("已清屏") } }
@@ -444,15 +466,165 @@ private const val FULL_STOP_DELAY_MS = 120000L
             }.start()
         }
         try { tone?.release(); tone = null } catch (_: Throwable) { }
+        // 语音引擎也要关掉，不然它会一直占着（下次进 App 还会接着念没念完的）
+        try { tts?.stop() } catch (_: Throwable) { }
+        try { tts?.shutdown(); tts = null } catch (_: Throwable) { }
         EngineService.stop(this)      // 引擎都停了，前台服务也要撤掉
         // 内置驱动要【彻底停掉】而不只是解绑：只解绑的话服务照样活着、占着 USB，
         // 退出 App 后电视棒就一直打不开，而通知栏的通知却已经消失。
         BuiltinDriver.stop(this)
     }
 
-    // ---------------------------------------------------------- 告警音
+    /**
+     * 语音播报开关：解出一趟列车就把【车次 / 线路 / 上下行 / 速度 / 公里标 / 距离】念出来。
+     * 没解出来的项直接跳过（基础帧里往往还没有机车/线路，硬念"未知"很难听）。
+     */
+    private fun setVoiceEnabled(on: Boolean) {
+        prefs.edit().putBoolean("voice", on).apply()
+        if (!on) {
+            try { tts?.stop() } catch (_: Throwable) { }
+            return
+        }
+        // 语音引擎要一两秒才就绪，所以第一次打开时才初始化
+        if (tts == null) {
+            tts = TextToSpeech(this) { st ->
+                ttsOk = (st == TextToSpeech.SUCCESS)
+                var lang = -1
+                if (ttsOk) {
+                    // 中文语言包不一定装在这台机器上：按 简体中文 → 中文 → 系统默认 依次试
+                    for (loc in arrayOf(Locale.SIMPLIFIED_CHINESE, Locale.CHINESE, Locale.getDefault())) {
+                        try {
+                            val r = tts?.setLanguage(loc)
+                            if (r != TextToSpeech.LANG_MISSING_DATA && r != TextToSpeech.LANG_NOT_SUPPORTED) {
+                                lang = 0
+                                break
+                            }
+                            lang = (r ?: -1)
+                        } catch (_: Throwable) { }
+                    }
+                    if (lang != 0) ttsOk = false
+                }
+                android.util.Log.i("LBJVOICE", "TTS init status=" + st + " lang=" + lang)
+                main.post {
+                    if (ttsOk) {
+                        toast("语音播报已开启")
+                    } else {
+                        // 引擎在、但缺中文语音包（或语音服务被禁用）：说清楚原因并给一条出路
+                        chkVoice.isChecked = false
+                        prefs.edit().putBoolean("voice", false).apply()
+                        AlertDialog.Builder(this)
+                            .setTitle("语音播报打不开")
+                            .setMessage("这台手机的语音引擎没有可用的中文语音包。\n\n" +
+                                "到系统的「文字转语音」设置里把语音数据下载/启用后，再回来打开这个开关。")
+                            .setPositiveButton("去设置") { _, _ ->
+                                try {
+                                    startActivity(Intent("com.android.settings.TTS_SETTINGS"))
+                                } catch (_: Throwable) {
+                                    try { startActivity(Intent(android.provider.Settings.ACTION_SETTINGS)) } catch (_: Throwable) { }
+                                }
+                            }
+                            .setNegativeButton("知道了", null)
+                            .show()
+                    }
+                }
+            }
+            return
+        }
+        if (ttsOk) toast("语音播报已开启")
+    }
+
+    /** 念一句（走媒体通道，和提示音/告警音一致）。 */
+    private fun speak(text: String) {
+        val t = tts ?: return
+        if (!ttsOk) return
+        try {
+            // ★ 正在念上一条时用 QUEUE_FLUSH：宁可把上一条掐掉，也不要排队积压 ——
+            //   车流密的时候（实测模拟源每秒一趟）排队会越念越旧，报的就不是当前这趟车了。
+            val mode = if (t.isSpeaking) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+            android.util.Log.i("LBJVOICE", "speak: " + text)
+            t.speak(text, mode, null, "lbj" + System.currentTimeMillis())
+        } catch (_: Throwable) { }
+    }
+
+    /** 这趟车最近是不是已经念过了（同一趟车的两种写法算一趟）。 */
+    private fun alreadySaid(tkey: String, train: String, pure: Boolean): Boolean {
+        val now = System.currentTimeMillis()
+        val it = voiceSaid.iterator()
+        while (it.hasNext()) {
+            val e = it.next()
+            if (now - e.third > VOICE_REPEAT_MS) { it.remove(); continue }
+            if (e.first != tkey) continue
+            val ePure = e.second.isNotEmpty() && e.second.all { c -> c.isDigit() }
+            // 与引擎 _same_train 同规则：字面相同，或数字相同且有一方是纯数字
+            if (e.second == train || pure || ePure) return true
+        }
+        return false
+    }
+
+    /** 决定要不要播报，并【延后一点】再念。
+     *
+     * 为什么要延后：基础帧先到（只有车次/速度/公里标），扩展帧大约 200ms 后到，
+     * 补上线路/机车/端位。立刻念的话会念一版缺线路的，然后扩展帧那版又被去重挡掉。
+     */
+    private fun voiceTrigger(t: JSONObject, train: String) {
+        if (!prefs.getBoolean("voice", false)) return
+        val tkey = t.optString("tkey", "").ifEmpty { train }
+        val pure = t.optBoolean("tpure", train.all { c -> c.isDigit() })
+        if (alreadySaid(tkey, train, pure)) return
+        voiceSaid.add(Triple(tkey, train, System.currentTimeMillis()))
+        main.postDelayed({ voiceSay(tkey) }, 700)
+    }
+
+    /** 从最新一帧里取这趟车信息最全的那条，念出来。 */
+    private fun voiceSay(tkey: String) {
+        if (!prefs.getBoolean("voice", false)) return
+        val o = lastSnapshot ?: return
+        val trains = o.optJSONArray("trains") ?: return
+        var best: JSONObject? = null
+        var bestScore = -1
+        for (i in 0 until trains.length()) {
+            val x = trains.optJSONObject(i) ?: continue
+            if (x.optString("tkey", x.optString("train")) != tkey) continue
+            var sc = 0
+            if (x.optString("route", "").let { it.isNotEmpty() && it != "----" }) sc += 2
+            if (x.optString("loco", "").let { it.isNotEmpty() && it != "----" }) sc += 1
+            if (sc > bestScore) { best = x; bestScore = sc }
+        }
+        val t = best ?: return
+        announce(t, o)
+    }
+
+    /** 组装一句话；缺哪项就少念哪项。 */
+    private fun announce(t: JSONObject, o: JSONObject) {
+        val train = t.optString("train", "").trim()
+        if (train.isEmpty() || train == "----") return
+        val parts = ArrayList<String>()
+        parts.add(train)
+        val route = t.optString("route", "").trim()
+        if (route.isNotEmpty() && route != "----") parts.add(route)
+        val dir = t.optString("direction", "").trim()
+        if (dir.isNotEmpty() && dir != "未知") parts.add(dir)
+        val spd = t.optString("speed", "").trim()
+        if (spd.isNotEmpty() && spd != "---") parts.add("速度 " + spd + " 公里每小时")
+        val km = t.optString("position", "").trim()
+        if (km.isNotEmpty() && km != "---.-") parts.add("公里标 " + km)
+        if (!o.isNull("eta_distance_km")) {
+            val d = o.optDouble("eta_distance_km", -1.0)
+            if (d >= 0.0) parts.add("距离 " + String.format(Locale.US, "%.1f", d) + " 公里")
+        }
+        speak(parts.joinToString("，"))
+    }
+    // ---------------------------------------------------------- 告警音 / 语音播报
     private var tone: ToneGenerator? = null
     private var lastTrainTs = 0.0
+    private var tts: TextToSpeech? = null
+    private var ttsOk = false
+    // 同一趟车不要反复念：LBJ 每隔几秒就重发一次，车次 -> 上次播报时刻
+    // 已播报过的：(归并键, 车次原串, 时刻)。用归并键是为了别把同一趟车念两遍
+    // —— 基础帧只有数字（'57'），扩展帧才带字母（'Z57'），实测就是念了两遍。
+    private val voiceSaid = ArrayList<Triple<String, String, Long>>()
+    private val VOICE_REPEAT_MS = 10 * 60 * 1000L
+    private var lastSnapshot: JSONObject? = null
 
     // 用【媒体通道】而不是【闹钟通道】：
     // 闹钟通道在很多机型上音量下限不为 0、还与系统闹钟绑定，用户根本关不掉；
@@ -819,6 +991,9 @@ private const val FULL_STOP_DELAY_MS = 120000L
                    else o.optDouble("eta_distance_km", Double.MAX_VALUE)
         val limit = prefs.getFloat("alarmkm", 5f).toDouble()
         val near = (status == "即将到达") || (status == "接近" && dist <= limit)
+
+        // 语音播报：与提示音同一个触发点（每解出一趟新车念一次；本车已在上面跳过）
+        voiceTrigger(t, t.optString("train", ""))
 
         if (near) {
             // 接近告警：独立开关，关掉就完全静音
@@ -2635,6 +2810,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
         btnSettings.isEnabled = true
         btnKeyword.isEnabled = true
         btnClear.isEnabled = true
+        btnHistory.isEnabled = true
         syncForeground()
     }
 
@@ -2746,7 +2922,13 @@ private const val FULL_STOP_DELAY_MS = 120000L
         // 不回填的话，重启后它静默丢失：状态列永远停在"未设置线路位置"，
         // ETA 不出现、接近告警永远不触发 —— 而设置框里还显示着用户填的值。
         t { applyRouteKm(eng) }
+        // 列车接收历史：目录给引擎（一天一个文件），保留天数 0 = 永久
+        t { eng.callAttr("set_history_dir", histDir()) }
+        t { eng.callAttr("set_history_keep_days", prefs.getInt("histkeep", 0)) }
     }
+
+    /** 历史文件目录（应用私有，不需要任何权限；导出后才能真正备份）。 */
+    private fun histDir(): String = File(filesDir, "history").absolutePath
 
     /**
      * 把 prefs 里的"线路=公里标"回填给引擎，并清除本轮已经不再出现的线路。
@@ -2841,6 +3023,277 @@ private const val FULL_STOP_DELAY_MS = 120000L
         return c
     }
 
+    // -------------------------------------------------------------- 列车接收历史
+    /**
+     * 历史操作总入口。
+     *
+     * 引擎在（正在接收/暂停）就调引擎 —— 内存里那份是最新的；引擎已经被丢弃
+     * （停止接收之后）就直接调 lbj_triplog 的 *_at 入口读磁盘：历史本来就存在磁盘上，
+     * 任何时候都该能看、能导出、能导入。
+     */
+    private fun histCall(method: String, vararg args: Any?): String {
+        val eng = engine
+        return try {
+            if (eng != null) eng.callAttr(method, *args).toString()
+            else Python.getInstance().getModule("lbj_triplog")
+                .callAttr(method + "_at", histDir(), *args).toString()
+        } catch (t: Throwable) {
+            android.util.Log.e("LBJHIST", method + " 失败", t)
+            ""
+        }
+    }
+
+    private fun histText(): String = histCall("history_export", pendingHistFmt, pendingHistScope, 7)
+
+    private fun loadHistDays(): List<String> {
+        return try {
+            val a = JSONObject(histCall("history_days_json")).optJSONArray("days") ?: JSONArray()
+            (0 until a.length()).mapNotNull {
+                a.optJSONObject(it)?.optString("date")?.takeIf { d -> d.isNotEmpty() }
+            }
+        } catch (t: Throwable) {
+            emptyList()
+        }
+    }
+
+    /** 重新读日期列表，尽量停在原来那一天（keepDate 为空 = 停当前这天）。 */
+    private fun refreshDaysAndList(keepDate: String? = null) {
+        val want = keepDate ?: histDays.getOrNull(histIdx) ?: ""
+        histStatus?.text = "读取中…"
+        Thread {
+            val days = loadHistDays()
+            main.post {
+                histDays = days
+                val i = if (want.isNotEmpty()) days.indexOf(want) else 0
+                histIdx = if (i >= 0) i else 0
+                refreshHistory()
+            }
+        }.start()
+    }
+
+    /** 读选中那天的记录（放后台线程：首次调用可能要等 Python 起来）。 */
+    private fun refreshHistory() {
+        val date = histDays.getOrNull(histIdx) ?: ""
+        val st = histStatus
+        val ad = histAdapter
+        Thread {
+            val trips = try {
+                JSONObject(histCall("history_day_json", date)).optJSONArray("trips") ?: JSONArray()
+            } catch (t: Throwable) {
+                JSONArray()
+            }
+            main.post {
+                histTrips = trips
+                ad?.notifyDataSetChanged()
+                val keep = prefs.getInt("histkeep", 0)
+                st?.text = (if (date.isEmpty()) "今天" else date) +
+                    String.format(Locale.US, "　共 %d 趟\n保留：%s　点一行看详情，导出/导入在下面按钮",
+                        trips.length(), if (keep <= 0) "永久" else keep.toString() + " 天")
+            }
+        }.start()
+    }
+
+    private fun histMove(delta: Int) {
+        if (histDays.isEmpty()) { toast("还没有任何记录"); return }
+        val n = histIdx + delta
+        if (n < 0 || n >= histDays.size) { toast(if (delta > 0) "已经是最早的一天" else "已经是最近的一天"); return }
+        histIdx = n
+        refreshHistory()
+    }
+
+    private fun showHistory() {
+        val pad = (resources.displayMetrics.density * 16).toInt()
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.setPadding(pad, pad / 2, pad, 0)
+        val st = TextView(this)
+        st.text = "读取中…"
+        col.addView(st)
+        histStatus = st
+
+        val bar = LinearLayout(this)
+        bar.orientation = LinearLayout.HORIZONTAL
+        val bPrev = Button(this).apply { isAllCaps = false; text = "◀ 前一天" }
+        bPrev.setOnClickListener { histMove(1) }
+        val bNext = Button(this).apply { isAllCaps = false; text = "后一天 ▶" }
+        bNext.setOnClickListener { histMove(-1) }
+        val bClr = Button(this).apply { isAllCaps = false; text = "清空这天" }
+        bClr.setOnClickListener { confirmHistClear() }
+        for (b in arrayOf(bPrev, bNext, bClr)) {
+            bar.addView(b, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        col.addView(bar)
+
+        val lv = ListView(this)
+        histAdapter = HistAdapter()
+        lv.adapter = histAdapter
+        lv.setOnItemClickListener { _, _, i, _ -> showHistDetail(i) }
+        col.addView(lv, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            (resources.displayMetrics.density * 300).toInt()))
+
+        histDialog = AlertDialog.Builder(this)
+            .setTitle("列车接收历史（点一行看详情）")
+            .setView(col)
+            .setPositiveButton("导出", null)
+            .setNeutralButton("导入", null)
+            .setNegativeButton("关闭", null)
+            .create()
+        histDialog?.setOnShowListener {
+            // ★ 自己换监听：默认行为会在点完就自动关窗，而"导出"还要选范围/格式、
+            //   "导入"还要选文件，窗先没了很别扭
+            histDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener { showHistExportDialog() }
+            histDialog?.getButton(AlertDialog.BUTTON_NEUTRAL)?.setOnClickListener {
+                histOpen.launch(arrayOf("text/*", "application/json", "application/octet-stream"))
+            }
+        }
+        histDialog?.show()
+        refreshDaysAndList()
+    }
+
+    /** 一行一条记录：车次 · 方向 / 起止时间 / 起止公里标 / 报文数 */
+    private inner class HistAdapter : BaseAdapter() {
+        override fun getCount(): Int = histTrips.length()
+        override fun getItem(position: Int): Any = position
+        override fun getItemId(position: Int): Long = position.toLong()
+        override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+            val v = convertView ?: layoutInflater.inflate(R.layout.view_ch_row, parent, false)
+            val t = histTrips.optJSONObject(position) ?: JSONObject()
+            v.findViewById<TextView>(R.id.chIndex).text = String.format(Locale.US, "%02d", position + 1)
+            val dir = t.optString("direction", "")
+            val cat = t.optString("category", "")
+            v.findViewById<TextView>(R.id.chName).text = t.optString("train", "----") +
+                (if (dir.isEmpty()) "" else "  " + dir) + (if (cat.isEmpty()) "" else "  " + cat)
+            v.findViewById<TextView>(R.id.chInfo).text = String.format(Locale.US,
+                "%s~%s   %s→%s km   %d 条",
+                t.optString("first_time", "--:--:--"), t.optString("last_time", "--:--:--"),
+                t.optString("start_km", "?"), t.optString("end_km", "?"), t.optInt("n_msg"))
+            v.findViewById<TextView>(R.id.chInfo).setTextColor(getColor(R.color.dim))
+            return v
+        }
+    }
+
+    private fun showHistDetail(i: Int) {
+        val t = histTrips.optJSONObject(i) ?: return
+        val sb = StringBuilder()
+        fun add(k: String, v: String) {
+            if (v.isNotEmpty() && v != "null") sb.append(k).append("：").append(v).append('\n')
+        }
+        fun pair(k: String, a: String, b: String) {
+            if (a.isEmpty() && b.isEmpty()) return
+            add(k, if (b.isEmpty() || a == b) a else a + " → " + b)
+        }
+        add("日期", t.optString("date"))
+        add("车次", t.optString("train"))
+        add("类别", t.optString("category"))
+        pair("方向", t.optString("direction"), t.optString("direction_last"))
+        pair("机车", t.optString("loco"), t.optString("loco_last"))
+        add("线路", t.optString("route"))
+        add("通联起止", t.optString("first_time") + " ~ " + t.optString("last_time"))
+        pair("公里标", t.optString("start_km"), t.optString("end_km"))
+        val mn = t.optString("min_km", ""); val mx = t.optString("max_km", "")
+        if (mn.isNotEmpty() && mx.isNotEmpty() && mn != mx) add("公里标范围", mn + " ~ " + mx)
+        pair("端位", t.optString("end_pos_first"), t.optString("end_pos_last"))
+        val lon1 = t.opt("lon_first"); val lat1 = t.opt("lat_first")
+        val lon2 = t.opt("lon_last"); val lat2 = t.opt("lat_last")
+        if (lon1 != null && lat1 != null) {
+            add("经纬度（首次）", String.format(Locale.US, "%.4f, %.4f", lon1, lat1))
+            if (lon2 != null && lat2 != null && (lon1 != lon2 || lat1 != lat2)) {
+                add("经纬度（最后）", String.format(Locale.US, "%.4f, %.4f", lon2, lat2))
+            }
+        } else {
+            add("经纬度", "这几条报文里没有（只有扩展帧才带）")
+        }
+        add("报文数", t.optInt("n_msg").toString())
+        val sp = t.optDouble("speed_max", -1.0)
+        if (sp >= 0.0) add("最大速度", String.format(Locale.US, "%.0f km/h", sp))
+        AlertDialog.Builder(this)
+            .setTitle("车次 " + t.optString("train"))
+            .setMessage(sb.toString())
+            .setPositiveButton("关闭", null)
+            .show()
+    }
+
+    private fun showHistExportDialog() {
+        val items = arrayOf(
+            "今天 · CSV（Excel 直接打开）", "最近 7 天 · CSV", "全部 · CSV",
+            "今天 · JSON（以后可再导入）", "最近 7 天 · JSON", "全部 · JSON")
+        AlertDialog.Builder(this)
+            .setTitle("导出历史")
+            .setItems(items) { _, w ->
+                pendingHistFmt = if (w >= 3) "json" else "csv"
+                pendingHistScope = when (w % 3) { 0 -> "today"; 1 -> "recent"; else -> "all" }
+                val today = LocalDate.now().toString()
+                val tag = when (pendingHistScope) {
+                    "today" -> today
+                    "recent" -> "最近7天-" + today
+                    else -> "全部-" + today
+                }
+                histCreate.launch("LBJ列车历史-" + tag + "." + pendingHistFmt)
+            }
+            .setNegativeButton(R.string.ch_cancel, null)
+            .show()
+    }
+
+    private fun confirmHistClear() {
+        val date = histDays.getOrNull(histIdx) ?: ""
+        val label = if (date.isEmpty()) "今天" else date
+        AlertDialog.Builder(this)
+            .setTitle("清空 " + label + " 的接收记录？")
+            .setPositiveButton("清空") { _, _ ->
+                Thread {
+                    val r = try { JSONObject(histCall("history_clear", date)) } catch (t: Throwable) { JSONObject() }
+                    main.post {
+                        toast(if (r.optBoolean("ok", false))
+                            String.format(Locale.US, "已清空 %d 条", r.optInt("removed"))
+                        else "清空失败：" + r.optString("why", ""))
+                        refreshDaysAndList()
+                    }
+                }.start()
+            }
+            .setNegativeButton(R.string.ch_cancel, null)
+            .show()
+    }
+
+    // 导出：系统的"新建文件"选择器（不需要存储权限，位置用户自己定）
+    private val histCreate = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain")
+    ) { uri ->
+        val u = uri ?: return@registerForActivityResult
+        Thread {
+            try {
+                val text = histText()
+                contentResolver.openOutputStream(u)?.use { it.write(text.toByteArray(Charsets.UTF_8)) }
+                main.post { toast("已导出：" + pendingHistFmt.uppercase(Locale.US) + "，" + text.length + " 字符") }
+            } catch (t: Throwable) {
+                main.post { toast("导出失败：" + (t.message ?: "")) }
+            }
+        }.start()
+    }
+
+    // 导入：系统的"打开文件"选择器，CSV/JSON 都认
+    private val histOpen = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        val u = uri ?: return@registerForActivityResult
+        Thread {
+            val text = try {
+                contentResolver.openInputStream(u)?.bufferedReader()?.use { it.readText() } ?: ""
+            } catch (t: Throwable) {
+                ""
+            }
+            val r = try { JSONObject(histCall("history_import", text)) } catch (t: Throwable) { JSONObject() }
+            main.post {
+                if (r.optBoolean("ok", false)) {
+                    toast(String.format(Locale.US, "导入完成：新增 %d 条，跳过 %d 条",
+                        r.optInt("added"), r.optInt("skipped")))
+                    if (histDialog?.isShowing == true) refreshDaysAndList() else showHistory()
+                } else {
+                    toast("导入失败：" + r.optString("why", "文件无法识别"))
+                }
+            }
+        }.start()
+    }
     private fun showSettings() {
         val pad = (resources.displayMetrics.density * 16).toInt()
         val box = LinearLayout(this)
@@ -2907,6 +3360,9 @@ private const val FULL_STOP_DELAY_MS = 120000L
             prefs.getFloat("mykm", -1f).let { if (it < 0) "" else it.toString() })
         val eRoute = textField(box, "按线路设公里标，格式 线路=公里标（如 京沪线=0123.4）",
             prefs.getString("routekm", "") ?: "", kRoute)
+        // 列车接收历史保留天数：0 = 永久保留（默认）
+        val eHist = numField(box, "列车历史保留天数（0 = 永久保留；填 180 就只留半年）",
+            prefs.getInt("histkeep", 0).toString())
 
         val view = ScrollView(this)
         view.addView(box)
@@ -2952,6 +3408,9 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 val alarmKm = eAlarmKm.text.toString().trim().toFloatOrNull()
                 chk(eAlarmKm, alarmKm != null && alarmKm > 0f && alarmKm <= 100f, "请输入 0.1 ~ 100")
 
+                val hist = eHist.text.toString().trim().toIntOrNull()
+                chk(eHist, hist != null && hist >= 0 && hist <= 36500, "请输入 0 ~ 36500（0 = 永久）")
+
                 val routeSpec = eRoute.text.toString().trim()
                 var routeName = ""
                 var routeVal = ""
@@ -2985,7 +3444,8 @@ private const val FULL_STOP_DELAY_MS = 120000L
                     .putFloat("thr", thr!!).putFloat("hold", hold!!).putBoolean("afc", cAfc.isChecked)
                     .putBoolean("beep", cBeep.isChecked)
                     .putBoolean("alarm", cAlarm.isChecked).putFloat("alarmkm", alarmKm!!)
-                    .putFloat("mykm", km!!).putString("routekm", routeSpec).apply()
+                    .putFloat("mykm", km!!).putString("routekm", routeSpec)
+                    .putInt("histkeep", hist!!).apply()
 
                 Thread {
                     try {
@@ -3016,6 +3476,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                         // 走统一入口：它还会把"这一轮不再出现"的旧线路清掉。
                         // 光调 set_route_km 的话，用户清空输入框后旧值仍然生效。
                         applyRouteKm(eng)
+                        eng.callAttr("set_history_keep_days", hist)
                         main.post {
                             when {
                                 needRestart ->
@@ -3164,7 +3625,20 @@ private const val FULL_STOP_DELAY_MS = 120000L
 
         val err = o.optString("error", "")
         val run = o.optBoolean("running", false)
-        if (run != running) { running = run; updateButtons() }
+        lastSnapshot = o
+        if (run != running) {
+            running = run
+            if (run) voiceSaid.clear()      // 新一场接收：允许重新播报同一趟车
+            updateButtons()
+        }
+
+        // 历史按钮上的角标：今天已经归档了几趟（引擎侧统计，停止后按最后一次的数）
+        val hist = o.optJSONObject("history")
+        if (hist != null) {
+            val n = hist.optInt("today", 0)
+            val want = if (n > 0) "历史($n)" else "历史"
+            if (btnHistory.text != want) btnHistory.text = want
+        }
 
         val now = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
         val kws = o.optJSONArray("keywords")

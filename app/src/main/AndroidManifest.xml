@@ -18,6 +18,14 @@
             <action android:name="android.intent.action.VIEW" />
             <data android:scheme="iqsrc" />
         </intent>
+        <!--
+            语音播报要绑定系统文字转语音引擎。Android 11+ 有包可见性限制：
+            不在这里声明 TTS_SERVICE，TextToSpeech 初始化会直接返回 ERROR(-1)，
+            而引擎其实是好的（实测小米语音引擎就是这么被挡掉的）。
+        -->
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
     </queries>
 
     <application

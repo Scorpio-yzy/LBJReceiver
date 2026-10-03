@@ -154,6 +154,7 @@ if not _HAVE_SCIPY:
 
 
 import lbj_ref as R
+import lbj_triplog as _Triplog
 
 SPECTRUM_BINS = 32    # 频谱显示格数
 ZOOM_HZ = 150000.0    # 频谱显示范围：目标频率 ±150 kHz
@@ -340,6 +341,9 @@ class LbjEngine:
         self._peak_delta = None
         self._trains = []          # 最近解出的车次记录
         self._trains_seen = {}
+        # 列车接收历史（按"趟"归档、一天一个文件）。_on_train 里喂给它，
+        # 落盘/导出/导入都在 lbj_triplog 里，界面通过下面几个 history_* 接口拿。
+        self.triplog = _Triplog.TripLog()
 
         # 默认参数
         self.freq_mhz = 821.2375
@@ -645,6 +649,10 @@ class LbjEngine:
         # 界面于是显示"已停止"并把【开始】按钮重新点亮 —— 而此时新引擎正在正常接收。
         # 用户会去查 USB 授权，其实完全无关。
         self._gen += 1
+        try:
+            self.triplog.flush(force=True)      # 停止接收：把当天的历史落盘
+        except Exception:
+            pass
         if self._src is not None:
             try:
                 # 参考实现的 _A2.read() 是 20×get(0.5s)，且不看 _running，
@@ -853,6 +861,10 @@ class LbjEngine:
             'ts': now,
             # 乘车模式标记：界面据此 ①不给自己坐的车响提示音 ②在列表里区别显示
             'muted': self.is_ride_train(train),
+            # 归并键：基础帧只有数字、扩展帧才带字母前缀（'57' / 'Z57' 是同一趟车）。
+            # 界面用它去重（语音播报别念两遍、历史按趟归档），与 _same_train 同一套规则。
+            'tkey': _train_digits(train) or train,
+            'tpure': str(train).isdigit(),
         }
         # ★ 乘车模式：我就在这趟车上，所以"我的位置"就是本车报的当前公里标。
         #   把它实时写进 my_km，界面上的"本站"就跟着我移动 —— 这样"距离/ETA"
@@ -865,6 +877,31 @@ class LbjEngine:
         # 经纬度只有扩展帧那次才有，所以采样必须放在去重判断【之前】，
         # 否则会被去重逻辑提前 return 掉，一个样本都采不到。
         self._collect_line_sample(route=s.get('route'), pos=s.get('position'))
+
+        # ---- 列车接收历史：一趟车一条，记起止时间/起止公里标/经纬度等 ----
+        # 端位与经纬度在 self.extra 里（decode_lbj 先跑，_capture_extra 已经更新过它）。
+        ex = self.extra or {}
+        try:
+            self.triplog.on_train({
+                'train': train,
+                # 归并键：基础帧只有数字、扩展帧才有字母前缀，必须按数字归并
+                'tkey': _train_digits(train) or train,
+                'tpure': str(train).isdigit(),
+                'category': rec['category'],
+                'direction': rec['direction'],
+                'speed': rec['speed'],
+                'position': rec['position'],
+                'loco': rec['loco'],
+                'loco_code': s.get('loco_code', ''),
+                'route': rec['route'],
+                'ts': now,
+                'end_pos': ex.get('end_pos'),
+                'lon': ex.get('lon'),
+                'lat': ex.get('lat'),
+            })
+        except Exception as e:
+            # 历史记录出问题绝不能影响解码主链路
+            print('LBJ-ENGINE-ERR triplog: %s' % e, flush=True)
 
         # ★ 按【车次】归并：同一趟车在列表里只占一行，每次收到就更新它并移到最前面。
         #
@@ -1067,6 +1104,55 @@ class LbjEngine:
             'samples': len(self._line.get(best[1], [])),
         }, ensure_ascii=False)
 
+    # --------------------------------------------- 列车接收历史
+    def set_history_dir(self, path):
+        """界面把可写目录传进来（filesDir/history）。返回是否启用成功。"""
+        ok = False
+        try:
+            ok = bool(self.triplog.set_root(path))
+        except Exception as e:
+            print('LBJ-ENGINE-ERR history dir: %s' % e, flush=True)
+        print('LBJ: 列车接收历史目录 = %s（%s）' % (path, '已启用' if ok else '未启用'), flush=True)
+        return ok
+
+    def set_history_keep_days(self, n):
+        """保留天数：0 = 永久保留（默认）。"""
+        try:
+            return int(self.triplog.set_keep_days(n))
+        except Exception:
+            return 0
+
+    def history_stats_dict(self):
+        try:
+            return self.triplog.stats()
+        except Exception:
+            return {'enabled': False, 'today': 0, 'keep_days': 0, 'err': '统计失败'}
+
+    # 下面这几个都转发到 lbj_triplog 的模块函数：与"没有引擎实例"时界面直接调
+    # lbj_triplog.history_* 是同一套实现，逻辑只写一遍。
+    def history_stats_json(self):
+        return _Triplog.history_stats_json(self.triplog)
+
+    def history_days_json(self):
+        """有记录的日期（新的在前）+ 每天几条，界面的日期选择用。"""
+        return _Triplog.history_days_json(self.triplog)
+
+    def history_day_json(self, date=''):
+        """某一天的记录（date 空 = 今天）。"""
+        return _Triplog.history_day_json(self.triplog, date)
+
+    def history_export(self, fmt='csv', scope='all', recent=0):
+        """导出历史：fmt = 'csv'/'json'；scope = 'today'/'recent'/'all'。"""
+        return _Triplog.history_export(self.triplog, fmt, scope, recent)
+
+    def history_import(self, text):
+        """导入（认 CSV/JSON），按 日期+车次+开始时间 去重。"""
+        return _Triplog.history_import(self.triplog, text)
+
+    def history_clear(self, date=''):
+        """清空某天（date 空 = 今天，'*' = 全部）。"""
+        return _Triplog.history_clear(self.triplog, date)
+
     def snapshot(self):
         g2 = R._g2
         # 直接使用参考实现 _A0 计算好的到达估算，不重复造轮子
@@ -1150,6 +1236,8 @@ class LbjEngine:
             # 参考实现里的计数器叫 word_count，没有 words_seen。
             # 之前名字写错，被 getattr 的默认值吞掉，这一格永远是 0。
             'sync_words': int(getattr(self._decoder, 'word_count', 0)) if self._decoder else 0,
+            # 列车接收历史：界面上按钮的角标用（今天收了几趟）
+            'history': self.history_stats_dict(),
         }
 
     def snapshot_json(self):
