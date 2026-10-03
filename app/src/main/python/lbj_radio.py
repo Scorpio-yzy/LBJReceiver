@@ -56,6 +56,23 @@ MODES = ('NFM', 'AM', 'WFM')
 CTCSS_DECIM = 16
 CTCSS_FS = AUDIO_RATE // CTCSS_DECIM     # 3000
 CTCSS_WIN = int(CTCSS_FS * 0.5)          # 1500 点 -> 分辨率 2Hz
+# 对频时"识别"未知亚音：要分辨 67.0 / 69.3（只差 2.3Hz），0.5 秒的 2Hz 分辨率不够，
+# 所以识别的窗用 1 秒（1Hz 分辨率）。
+CTCSS_ID_WIN = int(CTCSS_FS * 1.0)       # 3000 点
+CTCSS_ID_MIN = 0.12                      # 单点能量占比门限（纯正弦约 0.33，白噪声 0.005）
+
+# ★ 必须与 Kotlin 侧 RadioChannel.CTCSS_TONES 保持一致（那边 0 表示"关"）
+CTCSS_TONES = (
+    67.0, 69.3, 71.9, 74.4, 77.0, 79.7, 82.5, 85.4, 88.5,
+    91.5, 94.8, 97.4, 100.0, 103.5, 107.2, 110.9, 114.8, 118.8, 123.0,
+    127.3, 131.8, 136.5, 141.3, 146.2, 151.4, 156.7, 159.8, 162.2, 165.5,
+    167.9, 171.3, 173.8, 177.3, 179.9, 183.5, 186.2, 189.9, 192.8, 196.6,
+    199.5, 203.5, 206.5, 210.7, 218.1, 225.7, 229.1, 233.6, 241.8, 250.3,
+    254.1,
+)
+
+# 亚音识别的余弦/正弦基（按窗口长度缓存，避免每次调用都算 50×N 次 cos）
+_CTCSS_BASIS = {}
 
 # 弱信号自动高切的最低音频带宽（Hz）
 HC_MIN_HZ = 2000.0
@@ -66,6 +83,32 @@ HC_MIN_HZ = 2000.0
 #   结果强信号也被当成弱信号压窄带宽（测试抓出来过）。
 HC_RSSI_LO = -58.0
 HC_RSSI_HI = -35.0
+
+# ---------------------------------------------------------------------------
+# 对频（扫描找频）
+#
+# ★ 关键设计：【不要】每格重调一次硬件。
+#   逐格重调的话，每格要等 PLL 重锁 + 300ms 静音窗，一格就是 300ms ——
+#   10 MHz / 12.5kHz = 800 格，得扫 4 分钟，没法用。
+#   改成 FFT 扫描：硬件一次停在一个 800 kHz 窗口上，抓一段 IQ 做一次 FFT，
+#   一次就把这个窗口里 64 个格子全算出来，只有换窗口才动硬件。
+# ---------------------------------------------------------------------------
+SCAN_STEP_HZ = 12500.0        # 扫描格子（铁路/业余 NFM 常用步进）
+SCAN_WIN_SPAN_HZ = 800000.0   # 每个硬件窗口只取中间 800kHz 用（两侧有模拟滤波器滚降）
+SCAN_FFT_N = 32768            # 每窗口 FFT 点数（34ms @960k -> bin 29Hz）
+SCAN_DISCARD_BLOCKS = 2       # 换窗口后先丢几块：rtl_tcp 缓冲里还有换频前的数据
+SCAN_INTEG_BLOCKS = 2         # 每窗口用来积分的块数（多积一块，底噪估值更稳）
+SCAN_DC_GUARD_HZ = 30000.0    # 直流尖峰附近这么多 Hz 内不判信号（尖峰固定在硬件中心）
+SCAN_SPAN_DEFAULT_HZ = 10e6   # 默认：从当前频率向上扫 10 MHz
+SCAN_MIN_MARGIN_DB = 6.0      # 判"有信号"的最小余量（相对扫出来的底噪）
+SCAN_VERIFY_S = 0.90          # 命中后复核驻留（含调谐器稳定时间，顺便让人听到）
+SCAN_VERIFY_SKIP = 10         # 复核前先跳过这么多块（等 PLL 稳，别把换频瞬间算进去）
+SCAN_TONE_S = 1.15            # 读亚音驻留（要 1 秒窗才分得开 67.0/69.3）
+SCAN_MAX_RESULTS = 40         # 结果表上限
+# 电平接近满量程就说明前端被打饱和了：此时频率会偏、亚音会被削掉、
+# 还会冒出一堆互调假信号 —— 必须明确告诉用户"这次读数不可信"。
+SCAN_OVERLOAD_DB = -3.0       # 比这更响就认为过载（0 dB = 满量程）
+SCAN_HW_SETTLE_S = 0.12       # 换硬件窗口后额外等一会儿（按已处理音频时长算）
 
 # 每种模式的参数：信道带宽、解调后音频增益
 MODE_PARAMS = {
@@ -187,6 +230,13 @@ class RadioEngine:
         self._gain_db = 19.7
         self._ppm = 0
 
+        # 硬件（调谐器）实际停在哪 —— 软件换频要拿它算 DDC 偏移
+        self._hw_center = self._freq - DC_OFFSET_HZ
+        self._scan = None             # 对频状态机（None = 没在扫）
+        self._scan_last = None        # 上一次对频的结果（界面要显示那张表）
+        self._calib = None            # PPM 校准状态
+        self._scan_sq = True          # 扫描前的静噪状态，结束时还原
+
         self._rssi = -140.0
         self._open = False
         self._silent_ms = 0.0
@@ -230,6 +280,14 @@ class RadioEngine:
         if hz <= 0:
             return
         self._freq = hz
+        # 硬件中心 = 目标 − 50kHz（DC 避让）；软件 DDC 再把它搬回来。
+        # 对频扫描时硬件会停在别的窗口上，扫完要能把软件偏移还原，
+        # 否则回到正常收听会听到相差几百 kHz 的电台。
+        self._hw_center = hz - DC_OFFSET_HZ
+        try:
+            self._ddc.set_offset(DC_OFFSET_HZ)
+        except Exception:
+            pass
         # 调谐器换频后有一小段没稳，这期间的 RSSI 不能信：
         # 既不能拿去更新底噪，也不能放开静噪（否则喇叭会"噗"一声）。
         self._mute_until = self._elapsed + 0.3
@@ -375,6 +433,20 @@ class RadioEngine:
             if iq is None or len(iq) < 64:
                 continue
             block_reads += 1
+            # 对频扫描期间走扫描状态机（它自己决定要不要出声）
+            if self._scan is not None:
+                try:
+                    self._scan_tick(iq)
+                except Exception as e:
+                    self._err = '对频失败: %s' % e
+                    print('LBJ-RADIO-ERR scan: %s' % e, flush=True)
+                    self._scan = None
+                n += len(iq)
+                if block_reads % 40 == 0:
+                    s = self._scan
+                    print('LBJ: 对频中 %s %.4f MHz' % (
+                        (s or {}).get('phase', '?'), (s or {}).get('cur_hz', 0) / 1e6), flush=True)
+                continue
             try:
                 pcm, rssi = self._process(iq)
             except Exception as e:
@@ -408,12 +480,14 @@ class RadioEngine:
         if self._mode == 'WFM':
             rssi = 10.0 * np.log10(float(np.vdot(x, x).real) / max(1, len(x)) + 1e-12)
             audio = self._fm.process(x).astype(np.float64)
+            self._calib_feed(audio, MID_RATE)     # 校准要的是"鉴频器直流"，必须在高切之前取
             audio = self._adec.process(audio)
         else:
             x = self._dec.process(x)
             rssi = 10.0 * np.log10(float(np.vdot(x, x).real) / max(1, len(x)) + 1e-12)
             if self._mode == 'NFM':
                 audio = self._fm.process(x).astype(np.float64)
+                self._calib_feed(audio, AUDIO_RATE)
             else:
                 env = np.abs(x).astype(np.float64)
                 ref = float(np.mean(env)) if env.size else self._am_ref
@@ -421,7 +495,12 @@ class RadioEngine:
                 audio = env / max(self._am_ref, 1e-9) - 1.0
 
         # 亚音检测要用【高通之前】的信号，否则亚音已经被滤掉了
-        if self._ctcss > 0:
+        # 对频读亚音时走"全频点识别"，不用单点判决（同一条 300Hz 低通路）
+        _sc = self._scan
+        if _sc is not None and _sc.get('phase') in ('tone', 'tonecur'):
+            self._ctcss_feed(audio)
+            self._ctcss_ok = True
+        elif self._ctcss > 0:
             self._ctcss_ok = self._ctcss_check(audio)
         else:
             self._ctcss_ok = True
@@ -543,6 +622,438 @@ class RadioEngine:
         except Exception:
             pass
 
+    # ==================================================== 对频（扫描找频）
+    #
+    # 用途：找到附近那个台的【频率 + 亚音】，然后去把自己的对讲机设成一样的。
+    # 本机是纯接收，不参与通话。
+    #
+    # 流程：先（可选）读当前收听频率的亚音 -> FFT 扫一遍范围 -> 复核命中的点
+    #       -> 每个点驻留 1 秒读亚音 -> 列成一张表 -> 停在最强那个信号上。
+
+    def _tune_hw(self, hw_center):
+        """把调谐器挪到 hw_center（对频换窗口用）。
+
+        注意 _af() 收的是【目标频率】，它自己会减掉 50kHz 的 DC 避让，
+        所以要让硬件停在 hw_center，得传 hw_center + 50kHz。
+        """
+        self._hw_center = float(hw_center)
+        if self._src is not None:
+            try:
+                self._src._af(float(hw_center) + DC_OFFSET_HZ)
+            except Exception as e:
+                print('LBJ: 对频换窗口失败 %s' % e, flush=True)
+
+    def _tune_sw(self, hz):
+        """软件换频：硬件不动，只挪 DDC 偏移 —— 瞬间生效，没有 300ms 静音。
+
+        只在当前硬件窗口（±480kHz）内有效；对频复核命中的点都在窗口内，够用。
+        """
+        self._freq = float(hz)
+        try:
+            self._ddc.set_offset(float(hz) - float(self._hw_center))
+        except Exception:
+            pass
+
+    def start_scan(self, span_hz=None, read_cur=True, fine=True):
+        """开始对频：从当前频率向上扫 span_hz。返回 True。"""
+        span = float(span_hz or SCAN_SPAN_DEFAULT_HZ)
+        f0 = float(self._freq)
+        nwin = max(1, int(np.ceil(span / SCAN_WIN_SPAN_HZ)))
+        # ★ 两趟扫描，第二趟窗口错开半个窗口。
+        #   原因：直流尖峰固定落在【硬件窗口中心】，中心 ±SCAN_DC_GUARD_HZ 内读数不可信，
+        #   只扫一趟的话每隔一个窗口就有一条永久盲带（实测正好把测试信号埋了）。
+        #   错开半窗后，第一趟的盲区正好落在第二趟的中间，反过来也是。
+        wins = [f0 + SCAN_WIN_SPAN_HZ * (k + 0.5) for k in range(nwin)]
+        wins += [f0 + SCAN_WIN_SPAN_HZ * (k + 1.0) for k in range(nwin)]
+        self._scan_sq = self._squelch_on          # 扫描期间强制出声，结束时还原
+        self._scan_last = None
+        self._scan = {
+            'phase': 'tonecur' if read_cur else 'window',
+            'start_hz': f0, 'end_hz': f0 + span, 'span_hz': span,
+            'wins': wins, 'wi': 0, 'cur_hz': f0,
+            'read_cur': bool(read_cur), 'fine': bool(fine),
+            'discard_left': 0, 'integ_left': 0, 'acc': [],
+            'meas': [], 'hits': [], 'hi': 0, 'results': [],
+            'floor': None, 'thr': None, 'left': SCAN_TONE_S,
+            'n_ch': 0, 'stop': False, 'vset': None, 'rssi_acc': [],
+        }
+        self._ctcss_buf = np.zeros(0, dtype=np.float64)
+        self._squelch_on = False
+        self._open = False
+        self._silent_ms = 0.0
+        print('LBJ: 对频开始 %.4f~%.4f MHz（%d 窗口，读当前亚音=%s，自动微调=%s）'
+              % (f0 / 1e6, (f0 + span) / 1e6, nwin, read_cur, fine), flush=True)
+        return True
+
+    def stop_scan(self):
+        if self._scan is not None:
+            self._scan['stop'] = True
+        return True
+
+    # ------------------------------------------------------------ 扫描状态机
+    def _scan_tick(self, iq):
+        s = self._scan
+        if s is None:
+            return
+        blk_s = len(iq) / float(RTL_RATE)
+        ph = s['phase']
+
+        # ---- 可选：先读当前收听频率的亚音（不扫，只听这一格）----
+        if ph == 'tonecur':
+            pcm, rssi = self._process(iq)
+            self._rssi = rssi
+            self._push_audio(pcm)
+            s['left'] -= blk_s
+            if s['left'] <= 0:
+                d = self._ctcss_identify()
+                base = self._floor if self._floor is not None else -100.0
+                if rssi >= base + SCAN_MIN_MARGIN_DB:
+                    s['results'].append({'freq': round(float(self._freq), 1),
+                                         'tone': d['tone'], 'score': d['score'],
+                                         'db': round(float(rssi), 1), 'cur': True})
+                s['phase'] = 'window'
+            return
+
+        # ---- 换硬件窗口 ----
+        if ph == 'window':
+            if s['stop'] or s['wi'] >= len(s['wins']):
+                self._scan_finish_sweep(s)
+                return
+            c = s['wins'][s['wi']]
+            s['cur_hz'] = c
+            self._tune_hw(c)
+            blk_n = int(SCAN_HW_SETTLE_S * RTL_RATE / max(1, len(iq)))
+            s['discard_left'] = SCAN_DISCARD_BLOCKS + blk_n
+            s['acc'] = []
+            s['phase'] = 'discard'
+            return
+
+        # ---- 丢几块（缓冲里还有换频前的数据）----
+        if ph == 'discard':
+            s['discard_left'] -= 1
+            if s['discard_left'] <= 0:
+                s['integ_left'] = SCAN_INTEG_BLOCKS
+                s['phase'] = 'measure'
+            return
+
+        # ---- 抓够就做一次 FFT，把这个窗口的格子全算出来 ----
+        if ph == 'measure':
+            # ★ 必须保持复数！写成 float32 会把虚部丢掉（NFM 直接解不出来）
+            s['acc'].append(np.asarray(iq, dtype=np.complex64))
+            s['integ_left'] -= 1
+            if s['integ_left'] <= 0:
+                self._scan_measure_window(s)
+                s['acc'] = []
+                s['wi'] += 1
+                s['phase'] = 'window'
+            return
+
+        # ---- 复核候选：软件调过去，驻留几百毫秒顺便出声 ----
+        if ph == 'verify':
+            if s['stop'] or s['hi'] >= len(s['hits']):
+                s['phase'] = 'done'
+                return
+            h = s['hits'][s['hi']]
+            if s.get('vset') != h['freq']:
+                # ★ 必须【重新调硬件】：扫描结束时硬件停在最后一个窗口上，
+                #   而候选可能在 10 MHz 之外，软件 DDC 只在 ±480kHz 内有效 ——
+                #   用软件跳过去会量到完全错误的东西（这条踩过）。
+                self.set_frequency(h['freq'])
+                s['vset'] = h['freq']
+                s['left'] = SCAN_VERIFY_S
+                s['rssi_acc'] = []
+                s['vskip'] = SCAN_VERIFY_SKIP
+            pcm, rssi = self._process(iq)
+            self._rssi = rssi
+            if s.get('vskip', 0) > 0:
+                s['vskip'] -= 1
+            else:
+                s['rssi_acc'].append(rssi)
+            self._push_audio(pcm)
+            s['cur_hz'] = h['freq']
+            s['left'] -= blk_s
+            if s['left'] <= 0:
+                avg = float(np.mean(s['rssi_acc'])) if s['rssi_acc'] else -140.0
+                print('LBJ: 复核 %.4f MHz  实测 %.1f dB  门限 %.1f'
+                      % (h['freq'] / 1e6, avg, s['thr'] or -100.0), flush=True)
+                if avg >= (s['thr'] if s['thr'] is not None else -100.0):
+                    h['db'] = round(avg, 1)
+                    if s['fine'] and h.get('cf'):
+                        h['freq'] = float(h['cf'])      # 用 FFT 能量重心做微调
+                    s['phase'] = 'tone'
+                    s['left'] = SCAN_TONE_S
+                    self._ctcss_buf = np.zeros(0, dtype=np.float64)
+                else:
+                    s['hi'] += 1
+                    s['vset'] = None
+            return
+
+        # ---- 读亚音：驻留 1 秒，全频点识别 ----
+        if ph == 'tone':
+            if s['hi'] >= len(s['hits']):
+                s['phase'] = 'done'
+                return
+            pcm, rssi = self._process(iq)
+            self._rssi = rssi
+            self._push_audio(pcm)
+            s['cur_hz'] = s['hits'][s['hi']]['freq']
+            s['left'] -= blk_s
+            if s['left'] <= 0:
+                d = self._ctcss_identify()
+                h = s['hits'][s['hi']]
+                ovl = float(h.get('db', 0)) > SCAN_OVERLOAD_DB
+                s['results'].append({'freq': round(float(h['freq']), 1),
+                                     'tone': d['tone'], 'score': d['score'],
+                                     'db': h.get('db', 0), 'cur': False, 'ovl': ovl})
+                print('LBJ: 对频命中 %.4f MHz  %.1f dB  亚音 %s%s'
+                      % (h['freq'] / 1e6, h.get('db', 0),
+                         ('%.1f Hz' % d['tone']) if d['tone'] > 0 else '无',
+                         '  ★过载：频率/亚音都不可信，请降低增益或拉远距离' if ovl else ''),
+                      flush=True)
+                s['hi'] += 1
+                s['vset'] = None
+                s['phase'] = 'verify'
+            return
+
+        # ---- 收尾 ----
+        if ph == 'done':
+            res = s['results']
+            self._squelch_on = getattr(self, '_scan_sq', True)
+            self._scan_last = s
+            self._scan = None
+            if res:
+                best = max(res, key=lambda r: r.get('db') or -999)
+                self.set_frequency(best['freq'])       # 停在最强那个信号上
+            else:
+                self.set_frequency(s['start_hz'])
+            print('LBJ: 对频结束，%d 个信号，%d 格' % (len(res), s['n_ch']), flush=True)
+
+    # ------------------------------------------------------------ PPM 校准
+    def start_calib(self, seconds=4.0):
+        """开始测载波频偏。返回 {'ok':..., 'why':...}。
+
+        原理：FM 鉴频器的输出，在"载波正好落在信道中心"时均值是 0；
+        载波偏高多少 Hz，鉴频输出的【直流】就是多少 —— 换算 f = dc × fs/2。
+
+        ★ 为什么不用频谱峰值/质心：FM 广播的 19kHz 导频、38kHz 立体声副载波、
+          RDS 全在载波【上方】，会把峰值和质心整体拉高约 +2kHz（实测 95.9 读成
+          95.9023 就是这么来的）。而音频本身没有直流分量，所以鉴频直流只反映
+          载波偏了多少，不受调制内容影响。
+        """
+        if self._mode not in ('WFM', 'NFM'):
+            return {'ok': False, 'why': '只有 NFM/WFM 能测（AM 没有鉴频器）'}
+        if not self.is_connected():
+            return {'ok': False, 'why': '没有数据源'}
+        fs = MID_RATE if self._mode == 'WFM' else AUDIO_RATE
+        self._calib = {'want': float(seconds) * fs, 'n': 0, 'sum': 0.0,
+                       'freq': float(self._freq), 'ppm0': int(self._ppm),
+                       'fs': fs, 'done': False, 'offset_hz': None,
+                       'ppm_delta': None, 'ppm_suggest': None, 'rssi': 0.0}
+        return {'ok': True, 'why': ''}
+
+    def calib_state(self):
+        c = self._calib
+        if c is None:
+            return None
+        prog = 0.0 if not c['want'] else min(1.0, c['n'] / c['want'])
+        return {'done': bool(c['done']), 'progress': round(prog, 3),
+                'freq': c['freq'], 'ppm_now': c['ppm0'],
+                'offset_hz': c['offset_hz'], 'ppm_delta': c['ppm_delta'],
+                'ppm_suggest': c['ppm_suggest'], 'rssi': round(float(self._rssi), 1)}
+
+    def _calib_feed(self, x, fs):
+        c = self._calib
+        if c is None or c['done'] or x.size == 0:
+            return
+        c['sum'] += float(np.sum(x))
+        c['n'] += int(x.size)
+        if c['n'] >= c['want']:
+            dc = c['sum'] / float(c['n'])
+            off = dc * float(fs) / 2.0
+            # 建议值 = 当前 ppm + 修正量；修正量 = −偏移/频率×1e6（实测方向由"填了再看"确认）
+            delta = -off / float(c['freq']) * 1e6
+            c['offset_hz'] = round(off, 1)
+            c['ppm_delta'] = round(delta, 1)
+            c['ppm_suggest'] = int(round(c['ppm0'] + delta))
+            c['done'] = True
+            print('LBJ: PPM 校准 %.4f MHz  载波偏 %+.0f Hz  当前 ppm=%d  建议 %+d'
+                  % (c['freq'] / 1e6, off, c['ppm0'], c['ppm_suggest']), flush=True)
+
+    def _push_audio(self, pcm):
+        if self._audio is not None and pcm is not None and pcm.size:
+            try:
+                self._audio.write(pcm.tobytes())
+            except Exception as e:
+                self._err = '音频输出失败: %s' % e
+
+    def _fft_psd(self, seg):
+        """一段 IQ 的功率谱。
+
+        标定：sum(PSD) == 这段信号的均方值（汉宁窗已做能量归一），
+        所以"某个带宽内的 PSD 求和"与正常收听时的 RSSI 是同一把尺子。
+        """
+        n = seg.size
+        w = np.hanning(n).astype(np.float32)
+        X = np.fft.fftshift(np.fft.fft(seg * w))
+        return (X.real ** 2 + X.imag ** 2) / (n * float(np.sum(w ** 2)))
+
+    def _scan_measure_window(self, s):
+        """把一个硬件窗口的 IQ 做 FFT，算出窗口内每个 12.5kHz 格子的功率。"""
+        if not s['acc']:
+            return
+        x = np.concatenate(s['acc'])
+        n = int(SCAN_FFT_N)
+        x = x[:max(n, (x.size // n) * n)]
+        if x.size < n:
+            return
+        acc = None
+        for k in range(0, x.size - n + 1, n):
+            p = self._fft_psd(x[k:k + n])
+            acc = p if acc is None else acc + p
+        if acc is None:
+            return
+        c = float(s['wins'][s['wi']])
+        df = RTL_RATE / float(n)
+        half = max(1, int(SCAN_STEP_HZ / df / 2.0))
+        ncell = int(SCAN_WIN_SPAN_HZ / SCAN_STEP_HZ / 2.0)
+        for i in range(-ncell, ncell + 1):
+            fq = c + i * SCAN_STEP_HZ
+            if fq < s['start_hz'] - 1.0 or fq > s['end_hz'] + 1.0:
+                continue
+            b = int(round((fq - c) / df)) + n // 2
+            lo = max(0, b - half)
+            hi = min(n, b + half + 1)
+            p = float(np.sum(acc[lo:hi]))
+            # ★ 频率要用【峰值 bin + 抛物线插值】来报，不能用带内能量质心：
+            #   格子宽 12.5kHz 但 FFT 的 bin 只有 29Hz，峰值插值能进到 kHz 以内；
+            #   而质心会被 FM 广播的 19kHz 导频 / 38kHz 立体声副载波整体拉高
+            #   （实测把 95.9 报成 95.9129）—— 质心不是载波频率。
+            fpk = fq
+            kmax = lo + int(np.argmax(acc[lo:hi]))
+            if 0 < kmax < n - 1:
+                y0, y1, y2 = float(acc[kmax - 1]), float(acc[kmax]), float(acc[kmax + 1])
+                den = y0 - 2.0 * y1 + y2
+                if abs(den) > 1e-30:
+                    dl = 0.5 * (y0 - y2) / den
+                    dl = max(-0.5, min(0.5, dl))
+                    fpk = c + (kmax - n / 2.0 + dl) * df
+            s['meas'].append((fq, 10.0 * np.log10(p + 1e-20), c, fpk))
+            s['n_ch'] += 1
+
+    def _scan_finish_sweep(self, s):
+        """扫完所有窗口：估底噪、挑候选（连续超门限的合成一个，取峰值与该组能量重心）。"""
+        m = s['meas']
+        if not m:
+            s['phase'] = 'done'
+            return
+        # 同一个格子可能被两趟都测到：取较大的；只被盲区覆盖过的格子直接丢掉
+        best = {}
+        for fq, d, c, fpk in m:
+            if abs(fq - c) < SCAN_DC_GUARD_HZ:
+                continue
+            if fq not in best or d > best[fq][0]:
+                best[fq] = (d, fpk)
+        if not best:
+            s['phase'] = 'done'
+            return
+        items = sorted(best.items())
+        dbs = np.array([v[0] for _, v in items], dtype=np.float64)
+        floor = float(np.percentile(dbs, 25))
+        margin = max(SCAN_MIN_MARGIN_DB, float(self._squelch_db) * 0.6)
+        thr = floor + margin
+        s['floor'] = round(floor, 1)
+        s['thr'] = round(thr, 1)
+
+        hits = []
+        cur = None
+        for fq, (d, fpk) in items:
+            if d >= thr:
+                w = 10.0 ** (d / 10.0)
+                if cur is None:
+                    cur = {'freq': fq, 'db': d, 'w': w, 'wf': w * fq, 'fpk': fpk}
+                else:
+                    cur['w'] += w
+                    cur['wf'] += w * fq
+                    if d > cur['db']:
+                        cur['freq'], cur['db'], cur['fpk'] = fq, d, fpk
+            else:
+                if cur is not None:
+                    hits.append(cur)
+                    cur = None
+        if cur is not None:
+            hits.append(cur)
+        for h in hits:
+            # 峰值 bin 估计（准）；万一是平的没插出来，退回能量质心
+            h['cf'] = h.get('fpk') or (h['wf'] / h['w'] if h['w'] > 0 else h['freq'])
+        hits.sort(key=lambda h: -h['db'])
+        s['hits'] = hits[:SCAN_MAX_RESULTS]
+        s['phase'] = 'verify'
+        s['hi'] = 0
+        s['vset'] = None
+        print('LBJ: 对频扫描完成 %d 格（%d 格有效）  底噪 %.1f  门限 %.1f  候选 %d'
+              % (len(m), len(items), floor, thr, len(s['hits'])), flush=True)
+
+    # ------------------------------------------------------------ 亚音识别
+    def _ctcss_feed(self, x):
+        """把解调后的低频段喂进亚音缓冲（复用 300Hz 低通那一路）。"""
+        try:
+            y = self._ctcss_lp.process(x)
+            if y.size:
+                self._ctcss_buf = np.concatenate([self._ctcss_buf, y])[-CTCSS_ID_WIN:]
+        except Exception:
+            pass
+
+    def _ctcss_identify(self):
+        """识别亚音：对全部 50 个标准频点算能量占比，取最强者。
+
+        判据与单点判决一致（纯正弦约 0.33，白噪声约 0.005），但窗用 1 秒。
+        返回 {'tone': Hz（0=没识别到）, 'score': 最强占比, 'second': 次强占比}。
+        """
+        z = self._ctcss_buf
+        n = int(z.size)
+        if n < CTCSS_ID_WIN * 0.5:
+            return {'tone': 0.0, 'score': 0.0, 'second': 0.0}
+        zw = z * np.hanning(n)
+        tot = float(np.dot(zw, zw))
+        if tot <= 1e-18:
+            return {'tone': 0.0, 'score': 0.0, 'second': 0.0}
+        key = n
+        if key not in _CTCSS_BASIS:
+            idx = np.arange(n, dtype=np.float64)
+            ws = (2.0 * np.pi * np.asarray(CTCSS_TONES) / float(CTCSS_FS))[:, None]
+            _CTCSS_BASIS.clear()
+            _CTCSS_BASIS[key] = (np.cos(ws * idx), np.sin(ws * idx))
+        C, S = _CTCSS_BASIS[key]
+        cg = C @ zw
+        sg = S @ zw
+        r = (cg * cg + sg * sg) / (tot * n)
+        order = np.argsort(r)[::-1]
+        best = float(r[order[0]])
+        second = float(r[order[1]]) if r.size > 1 else 0.0
+        if best < CTCSS_ID_MIN:
+            return {'tone': 0.0, 'score': round(best, 4), 'second': round(second, 4)}
+        return {'tone': float(CTCSS_TONES[int(order[0])]),
+                'score': round(best, 4), 'second': round(second, 4)}
+
+    def _scan_snapshot(self):
+        s = self._scan if self._scan is not None else self._scan_last
+        if s is None:
+            return None
+        ph = s.get('phase')
+        nw = max(1, len(s.get('wins') or [1]))
+        prog = (s.get('wi', 0) + (1.0 if ph in ('verify', 'tone', 'done') else 0.0)) / nw
+        return {
+            'active': bool(self._scan is not None),
+            'phase': ph,
+            'cur_hz': round(float(s.get('cur_hz') or 0.0), 1),
+            'start_hz': s.get('start_hz'), 'end_hz': s.get('end_hz'),
+            'progress': round(min(1.0, prog), 3),
+            'floor': s.get('floor'), 'thr': s.get('thr'),
+            'n_ch': s.get('n_ch', 0),
+            'n_hit': len(s.get('hits') or []),
+            'results': s.get('results') or [],
+        }
+
     # ------------------------------------------------------------ 状态
     def snapshot(self):
         return {
@@ -564,6 +1075,8 @@ class RadioEngine:
             'ppm': self._ppm,
             'spectrum': list(self._spectrum),
             'samples': self._samples_out,
+            'scan': self._scan_snapshot(),
+            'calib': self.calib_state(),
             'err': self._err,
         }
 
