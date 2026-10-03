@@ -79,13 +79,44 @@ HC_RSSI_HI = -35.0
 #   一次就把这个窗口里 64 个格子全算出来，只有换窗口才动硬件。
 # ---------------------------------------------------------------------------
 SCAN_STEP_HZ = 12500.0        # 扫描格子（铁路/业余 NFM 常用步进）
-SCAN_WIN_SPAN_HZ = 800000.0   # 每个硬件窗口只取中间 800kHz 用（两侧有模拟滤波器滚降）
+SCAN_WIN_FRACTION = 0.8333    # 一个窗口只用采样率的 83%（留边：躲开两侧滚降和奈奎斯特）
+SCAN_WIN_SPAN_HZ = 800000.0   # 960k 采样时的窗口宽（= 960k × 0.833，其余速率按比例算）
 SCAN_FFT_N = 32768            # 每窗口 FFT 点数（34ms @960k -> bin 29Hz）
 SCAN_DISCARD_BLOCKS = 2       # 换窗口后先丢几块：rtl_tcp 缓冲里还有换频前的数据
 SCAN_INTEG_BLOCKS = 2         # 每窗口用来积分的块数（多积一块，底噪估值更稳）
 SCAN_DC_GUARD_HZ = 30000.0    # 直流尖峰附近这么多 Hz 内不判信号（尖峰固定在硬件中心）
-SCAN_SPAN_DEFAULT_HZ = 10e6   # 默认：从当前频率向上扫 10 MHz
+SCAN_SPAN_DEFAULT_HZ = 20e6   # 默认：当前频率【上下各 10 MHz】（实测一趟约 2.4 秒）
+# 换窗口的那点固定开销（等 PLL + 丢缓冲块）是每窗口都要付一次的，
+# 所以"一趟扫得快"的关键是【窗口少】，不是 FFT 快：把采样率提到 2.4MS/s，
+# 一个窗口就能盖 2MHz（960k 时只有 800kHz），上下各 10MHz 从 52 个窗口降到 20 个。
+# 实测 FC0013：960k 一趟约 15s，2.4M 约 3s。驱动不认这个速率就退回 960k（校验见状态机）。
+SCAN_RATE = 2400000
+SCAN_WIN_SPAN_FAST_HZ = 2000000.0
+# ★ 驱动不一定给你请求的速率，块大小也不固定（实测本机 65536 采样一块，
+#   请求 2.4M 实测只有约 1.5M）。所以速率必须【量出来】：量到多少就用它当
+#   bin->Hz 的尺子、按它定窗口宽 —— 否则扫出来的频率会整体偏几倍。
+SCAN_RATE_CHECK_N = 8         # 用最初几块的到达间隔量真实速率
+SCAN_RATE_MIN = 200e3         # 量出来的速率限制在这个范围内才算数
+SCAN_RATE_MAX = 3.2e6
+SCAN_RATE_TOL = 50e3          # 和当前假定的速率差这么多就重排窗口
+SCAN_HW_LO_HZ = 24e6          # 电视棒能覆盖的下限
+SCAN_HW_HI_HZ = 1700e6        # 上限
 SCAN_MIN_MARGIN_DB = 6.0      # 判"有信号"的最小余量（相对扫出来的底噪）
+# 一条命中占了多少格子 -> 猜它是什么制式：FM 广播占 ~200kHz，NFM/AM 只占一两格。
+# 窄带信号光看频谱分不开 NFM 和 AM，所以只定这个界，另一个靠复核时换制式重试。
+SCAN_WFM_BW_HZ = 100e3
+# 门限附近的电平是抖的，会把一个电台的裙边切成好几段碎候选（实测 FM 广播被切成 5~6 段，
+# 复核时间全浪费在这些碎片上）。隔这么多个格子以内还算同一簇，两头一并。
+SCAN_CLUSTER_GAP_CELLS = 3
+# 真正的"占用带宽"要按【峰值以下 6dB】量，不能按门限量：门限是用户为了滤弱信号设的，
+# 设高一点就把 FM 广播的边带切掉了（实测 9dB 门限下，200kHz 的电台只剩 38kHz）。
+SCAN_OCC_6DB = 6.0            # 占用带宽的判据：比峰值低这么多 dB
+SCAN_OCC_MAX_HZ = 200e3       # 往两边最多找到这么远（别把隔壁台算进来）
+SCAN_WFM_BW6_HZ = 60e3        # -6dB 带宽超过这个就当宽信号（FM 广播 ~200kHz）
+# 宽信号（FM 广播）的判断/合并容差。真机实测：95.9 这个台不同趟的估计能在
+# 95.901~95.962 之间飘（61kHz），-6dB 带宽只量到 88kHz（电台频谱中间强、两边弱），
+# 所以宽信号直接按"广播级"容差 90kHz 走；窄带仍然只认一个格子。
+SCAN_WFM_MERGE_HZ = 90e3
 SCAN_VERIFY_S = 0.90          # 命中后复核驻留（含调谐器稳定时间，顺便让人听到）
 SCAN_VERIFY_SKIP = 10         # 复核前先跳过这么多块（等 PLL 稳，别把换频瞬间算进去）
 SCAN_TONE_S = 1.15            # 读亚音驻留（要 1 秒窗才分得开 67.0/69.3）
@@ -107,7 +138,7 @@ AUTOCAL_HI_HZ = 108.0e6
 AUTOCAL_GRID_HZ = 100e3       # 国内 FM 频点都在 100kHz 栅格上
 AUTOCAL_MEAS_S = 4.0          # 正式测量驻留时长
 AUTOCAL_VERIFY_S = 2.0        # 应用后复测时长
-SCAN_HW_SETTLE_S = 0.12       # 换硬件窗口后额外等一会儿（按已处理音频时长算）
+SCAN_HW_SETTLE_S = 0.0        # 额外等待；换频后的等待交给 SCAN_DISCARD_BLOCKS（那几块本就是脏数据）
 
 # 每种模式的参数：信道带宽、解调后音频增益
 MODE_PARAMS = {
@@ -232,6 +263,7 @@ class RadioEngine:
         # 硬件（调谐器）实际停在哪 —— 软件换频要拿它算 DDC 偏移
         self._hw_center = self._freq - DC_OFFSET_HZ
         self._scan = None             # 扫描状态机（None = 没在扫）
+        self._scan_rate = RTL_RATE    # 数据源当前实际跑着的采样率（扫描提速时会提上去）
         self._scan_last = None        # 上一次扫描的结果（界面要显示那张表）
         self._calib = None            # 手动 PPM 校准状态（量当前频率）
         self._autocal = None          # 自动 PPM 校准状态（自己找广播台）
@@ -666,25 +698,54 @@ class RadioEngine:
         except Exception:
             pass
 
-    def start_scan(self, span_hz=None, fine=True, margin_db=None):
-        """开始扫描：从当前频率向上扫 span_hz，把有信号的频点列出来。返回 True。
+    def _scan_win_span(self):
+        """一个硬件窗口能用多宽 = 当前(实测)采样率 × 0.833（取到 kHz）。
+
+        960k -> 800kHz（和原来一致），实测 1.5M -> 1.28MHz，2.4M -> 2MHz。
+        """
+        r = float(self._scan_rate or RTL_RATE)
+        return max(200e3, round(r * SCAN_WIN_FRACTION / 1000.0) * 1000.0)
+
+    def _scan_wins(self, lo, span):
+        """按当前采样率切窗口：两趟，第二趟错开半个窗口。
+
+        ★ 为什么要两趟：直流尖峰固定落在【硬件窗口中心】，中心 ±SCAN_DC_GUARD_HZ
+          内读数不可信，只扫一趟的话每隔一个窗口就有一条永久盲带（实测正好把测试
+          信号埋了）。错开半窗后，第一趟的盲区落在第二趟的窗口中间，反过来也是，
+          每个格子至少有一次是"在窗口中间"量到的 —— 顺便躲开窗口两侧的滚降。
+        """
+        w = self._scan_win_span()
+        nwin = max(1, int(np.ceil(span / w)))
+        wins = [lo + w * (k + 0.5) for k in range(nwin)]
+        wins += [lo + w * (k + 1.0) for k in range(nwin)]
+        return wins
+
+    def start_scan(self, span_hz=None, fine=True, margin_db=None, rate_hz=None):
+        """开始扫描：以当前频率为中心，上下各 span_hz/2 一路扫过去。
 
         margin_db：判定门限要比底噪高多少 dB（None = 按静噪档位自动推）。
+        rate_hz  ：扫描期间用的采样率（None = 自动挑最快的 SCAN_RATE；
+                   合成数据/不可提速的数据源传 RTL_RATE）。
+        复核用的是【当前制式】（self._mode）—— 外面设成什么就扫什么，
+        扫描窗里有制式切换键，扫的过程中也能换。
         """
         span = float(span_hz or SCAN_SPAN_DEFAULT_HZ)
         f0 = float(self._freq)
-        nwin = max(1, int(np.ceil(span / SCAN_WIN_SPAN_HZ)))
-        # ★ 两趟扫描，第二趟窗口错开半个窗口。
-        #   原因：直流尖峰固定落在【硬件窗口中心】，中心 ±SCAN_DC_GUARD_HZ 内读数不可信，
-        #   只扫一趟的话每隔一个窗口就有一条永久盲带（实测正好把测试信号埋了）。
-        #   错开半窗后，第一趟的盲区正好落在第二趟的中间，反过来也是。
-        wins = [f0 + SCAN_WIN_SPAN_HZ * (k + 0.5) for k in range(nwin)]
-        wins += [f0 + SCAN_WIN_SPAN_HZ * (k + 1.0) for k in range(nwin)]
+        lo = max(SCAN_HW_LO_HZ, f0 - span / 2.0)      # ★ 上下各一半，不是只往上扫
+        hi = min(SCAN_HW_HI_HZ, f0 + span / 2.0)
+        span = max(SCAN_STEP_HZ, hi - lo)
+        self._scan_rate = int(rate_hz or SCAN_RATE)
+        self._set_rate(self._scan_rate)
+        wins = self._scan_wins(lo, span)
+        nwin = len(wins) // 2
         self._scan_sq = self._squelch_on          # 扫描期间强制出声，结束时还原
         self._scan_last = None
         self._scan = {
             'phase': 'window',
-            'start_hz': f0, 'end_hz': f0 + span, 'span_hz': span,
+            'start_hz': lo, 'end_hz': hi, 'span_hz': span,
+            'fast': self._scan_rate > RTL_RATE,
+            'rc_n': 0, 'rc_t0': time.time(),
+            'blk_n': 0, 'smp_n': 0, 'sweep_t0': time.time(),
             'wins': wins, 'wi': 0, 'cur_hz': f0,
             'fine': bool(fine),
             'discard_left': 0, 'integ_left': 0, 'acc': [],
@@ -697,16 +758,120 @@ class RadioEngine:
         self._squelch_on = False
         self._open = False
         self._silent_ms = 0.0
-        print('LBJ: 扫描开始 %.4f~%.4f MHz（%d 窗口，自动微调=%s，门限%s）'
-              % (f0 / 1e6, (f0 + span) / 1e6, nwin, fine,
+        print('LBJ: 扫描开始 %.4f~%.4f MHz（上下各 %.0f MHz，%d 窗口×2 趟，采样率 %d，'
+              '自动微调=%s，门限%s）'
+              % (lo / 1e6, hi / 1e6, span / 2e6, nwin, self._scan_rate, fine,
                  '自动' if margin_db is None else '底噪+%.0f dB' % float(margin_db)),
               flush=True)
         return True
 
-    def stop_scan(self):
-        if self._scan is not None:
-            self._scan['stop'] = True
+    def stop_scan(self, keep_hz=None):
+        """停扫描。keep_hz 给了就停在它上面（用户点"设为当前频率"时用）。"""
+        s = self._scan
+        if s is not None:
+            s['stop'] = True
+            if keep_hz:
+                s['keep_hz'] = float(keep_hz)
         return True
+
+    def clear_scan(self):
+        """清空结果表（界面上的"清空"）。
+
+        正在扫的那一轮也清 —— 只清界面的话，下一轮快照又把引擎里的结果填回来了。
+        """
+        for s in (self._scan, self._scan_last):
+            if s is not None:
+                s['results'] = []
+        print('LBJ: 扫描结果已清空', flush=True)
+        return True
+
+    def _scan_tol(self, bw):
+        """判断"是不是同一个信号"的频率容差。
+
+        ★ 正在听 WFM 时直接给"广播级"90kHz：FM 广播自己就占 200kHz，电台之间至少隔
+          200kHz（国内 100kHz 栅格也不会有两个台挤在一起），而同一个台不同趟的估计
+          能飘几十 kHz（真机实测 95.9 裂成 95.901/95.962，97.4 裂成 97.452/97.399，
+          而且这些碎片单独看往往只量到 12kHz 宽，靠带宽根本认不出是同一个台）。
+        窄带（NFM/AM）则必须守住一个格子 —— 12.5kHz 的相邻信道不能并成一条。
+        """
+        b = float(bw or 0.0)
+        if self._mode == 'WFM' or b >= SCAN_WFM_BW6_HZ:
+            return max(SCAN_WFM_MERGE_HZ, b * 0.5)
+        return max(SCAN_STEP_HZ * 0.9, b * 0.4)
+
+    def _scan_merge_dups(self, s):
+        """把结果表里"同一个台的两条"并成一条（次数加权平均，保留扫到次数多的）。"""
+        out = []
+        for r in sorted(s.get('results') or [], key=lambda x: -int(x.get('n', 1))):
+            hit = None
+            for g in out:
+                if abs(r['freq'] - g['freq']) <= max(self._scan_tol(r.get('bw')),
+                                                     self._scan_tol(g.get('bw'))):
+                    hit = g
+                    break
+            if hit is None:
+                out.append(r)
+            else:
+                n1 = int(hit.get('n', 1))
+                n2 = int(r.get('n', 1))
+                hit['freq'] = round((hit['freq'] * n1 + r['freq'] * n2) / float(n1 + n2), 1)
+                hit['db'] = round((hit['db'] * n1 + r['db'] * n2) / float(n1 + n2), 1)
+                hit['n'] = n1 + n2
+                hit['ovl'] = bool(hit.get('ovl')) or bool(r.get('ovl'))
+        if len(out) != len(s.get('results') or []):
+            print('LBJ: 结果表里同一个信号并成一条：%d -> %d'
+                  % (len(s.get('results') or []), len(out)), flush=True)
+        s['results'] = out
+        return out
+
+    def _scan_put_result(self, s, h, fr, avg, ovl):
+        """把一条复核通过的命中并进结果表；重复扫到就按次平均，越扫越准。"""
+        tol = self._scan_tol(h.get('bw6') or h.get('bw'))
+        ex = None
+        best_d = None
+        for r0 in s['results']:
+            d0 = abs(float(r0.get('freq') or 0.0) - fr)
+            if d0 <= max(tol, self._scan_tol(r0.get('bw'))) and (best_d is None or d0 < best_d):
+                ex, best_d = r0, d0
+        if ex is not None:
+            # ★ 同一个信号每再扫到一次，就把它和已有估计【平均】一次：
+            #   单次估计受调制影响会偏（实测 95.9 会读成 95.9123），多趟平均往真值收敛。
+            n0 = int(ex.get('n', 1))
+            n1 = min(n0, 30)          # 上限：老数据不能永远压着，环境变了要能跟上
+            ex['freq'] = round((ex['freq'] * n1 + fr) / (n1 + 1), 1)
+            ex['n'] = n0 + 1
+            m0 = min(n0, 9)
+            ex['db'] = round((ex['db'] * m0 + avg) / (m0 + 1), 1)
+            ex['ovl'] = ovl
+            ex['mode'] = self._mode
+            ex['bw'] = h.get('bw6') or h.get('bw')
+            if n0 % 5 == 0:
+                print('LBJ: 复扫 %.4f MHz -> 修正为 %.4f MHz（第 %d 次，共 %d 个）'
+                      % (fr / 1e6, ex['freq'] / 1e6, ex['n'], len(s['results'])), flush=True)
+                self._scan_merge_dups(s)
+            return True
+        if len(s['results']) < SCAN_MAX_RESULTS:
+            s['results'].append({'freq': fr, 'db': round(avg, 1), 'n': 1,
+                                 'cur': False, 'ovl': ovl,
+                                 'mode': self._mode,
+                                 'bw': h.get('bw6') or h.get('bw')})
+            print('LBJ: 扫描命中 %.4f MHz  %.1f dB  %s（占用约 %.0f kHz）%s'
+                  % (fr / 1e6, avg, self._mode,
+                     (h.get('bw6') or h.get('bw') or 0.0) / 1e3,
+                     '  ★过载：频率不可信，请降低增益或拉远距离' if ovl else ''), flush=True)
+            self._scan_merge_dups(s)
+            return True
+        return False
+
+    def _set_rate(self, rate):
+        """切数据源采样率（扫描提速用），并记住实际值 —— FFT 靠它把 bin 换算成 Hz。"""
+        self._scan_rate = int(rate)
+        if self._src is None:
+            return
+        try:
+            self._src._send_cmd(R.CMD_SET_SAMPLERATE, int(rate))
+        except Exception as e:
+            print('LBJ: 切采样率失败 %s' % e, flush=True)
 
     @staticmethod
     def _margin_of(d):
@@ -754,7 +919,35 @@ class RadioEngine:
         s = self._scan
         if s is None:
             return
-        blk_s = len(iq) / float(RTL_RATE)
+        blk_s = len(iq) / float(self._scan_rate or RTL_RATE)
+        s['blk_n'] = int(s.get('blk_n', 0)) + 1      # 这一趟的块数/采样数（用来算真实速度）
+        s['smp_n'] = int(s.get('smp_n', 0)) + len(iq)
+
+        # ---- 量真实采样率（驱动可能不认请求值，块大小也不固定）----
+        # 只有连着真实数据源才量：合成数据/离线测试没有真实时序，量出来是假的。
+        if self._src is not None and s.get('rc_n', 0) < SCAN_RATE_CHECK_N:
+            s['rc_n'] = int(s.get('rc_n', 0)) + 1
+            if s['rc_n'] == SCAN_RATE_CHECK_N:
+                dt = (time.time() - float(s.get('rc_t0') or time.time())) / (SCAN_RATE_CHECK_N - 1)
+                blk = max(1, len(iq))
+                real = blk / dt if dt > 1e-6 else float(RTL_RATE)
+                real = max(SCAN_RATE_MIN, min(SCAN_RATE_MAX, real))
+                if abs(real - float(self._scan_rate or RTL_RATE)) > SCAN_RATE_TOL:
+                    # 假定值不对：改用它当尺子，并按新窗口宽重排这一趟
+                    # （重排前先清掉用旧尺子量出来的格子，那些频率是错的）
+                    self._scan_rate = real
+                    s['wins'] = self._scan_wins(s['start_hz'], s['span_hz'])
+                    s['wi'] = 0
+                    s['meas'] = []
+                    s['discard_left'] = SCAN_DISCARD_BLOCKS
+                    s['phase'] = 'window'
+                    s['fast'] = real > RTL_RATE * 1.05
+                    print('LBJ: 实测采样率 %.2f MS/s（请求 %d，块 %d 采样），'
+                          '窗口改 %.0f kHz × %d 个/趟'
+                          % (real / 1e6, SCAN_RATE, blk, self._scan_win_span() / 1e3,
+                             len(s['wins']) // 2), flush=True)
+                    return
+                s['fast'] = self._scan_rate > RTL_RATE * 1.05
         ph = s['phase']
 
         # ---- 换硬件窗口 ----
@@ -765,7 +958,7 @@ class RadioEngine:
             c = s['wins'][s['wi']]
             s['cur_hz'] = c
             self._tune_hw(c)
-            blk_n = int(SCAN_HW_SETTLE_S * RTL_RATE / max(1, len(iq)))
+            blk_n = int(SCAN_HW_SETTLE_S * (self._scan_rate or RTL_RATE) / max(1, len(iq)))
             s['discard_left'] = SCAN_DISCARD_BLOCKS + blk_n
             s['acc'] = []
             s['phase'] = 'discard'
@@ -803,9 +996,15 @@ class RadioEngine:
                 s['meas'] = []
                 s['wi'] = 0
                 s['phase'] = 'window'
+                s['blk_n'] = 0; s['smp_n'] = 0
+                s['sweep_t0'] = time.time()
+                if s.get('fast'):
+                    self._set_rate(SCAN_RATE)     # 复核用的 960k 切回快速档
                 return
             h = s['hits'][s['hi']]
             if s.get('vset') != h['freq']:
+                # 复核就用【用户当前设的制式】（扫描窗里有制式切换键），不自动分类：
+                # 外面设 NFM 就按 NFM 听、设 AM 就按 AM 听，扫出来的就是那一类信号。
                 # ★ 必须【重新调硬件】：扫描结束时硬件停在最后一个窗口上，
                 #   而候选可能在 10 MHz 之外，软件 DDC 只在 ±480kHz 内有效 ——
                 #   用软件跳过去会量到完全错误的东西（这条踩过）。
@@ -833,45 +1032,28 @@ class RadioEngine:
                         h['freq'] = float(h['cf'])      # 用峰值 bin 做微调
                     ovl = avg > SCAN_OVERLOAD_DB
                     fr = round(float(h['freq']), 1)
-                    # 去重：同一个信号（1.5 格内）只留一条；重复扫到就更新强度
-                    ex = None
-                    for r0 in s['results']:
-                        if abs(r0['freq'] - fr) <= SCAN_STEP_HZ * 1.5:
-                            ex = r0
-                            break
-                    if ex is not None:
-                        # ★ 同一个信号每再扫到一次，就把它和已有估计【平均】一次：
-                        #   单次峰值估计受调制影响会偏（实测 95.9 会读成 95.9123），
-                        #   多趟平均会一点点往真值收敛，越扫越准。
-                        n0 = int(ex.get('n', 1))
-                        n1 = min(n0, 30)      # 上限：老数据不能永远压着，环境变了要能跟上
-                        ex['freq'] = round((ex['freq'] * n1 + fr) / (n1 + 1), 1)
-                        ex['n'] = n0 + 1
-                        m0 = min(n0, 9)
-                        ex['db'] = round((ex['db'] * m0 + avg) / (m0 + 1), 1)
-                        ex['ovl'] = ovl
-                        if n0 % 5 == 0:
-                            print('LBJ: 复扫 %.4f MHz -> 修正为 %.4f MHz（第 %d 次，共 %d 个）'
-                                  % (fr / 1e6, ex['freq'] / 1e6, ex['n'], len(s['results'])),
-                                  flush=True)
-                    elif len(s['results']) < SCAN_MAX_RESULTS:
-                        s['results'].append({'freq': fr, 'db': round(avg, 1), 'n': 1,
-                                             'cur': False, 'ovl': ovl})
-                        print('LBJ: 扫描命中 %.4f MHz  %.1f dB%s'
-                              % (h['freq'] / 1e6, avg,
-                                 '  ★过载：频率不可信，请降低增益或拉远距离' if ovl else ''),
-                              flush=True)
-                s['hi'] += 1
-                s['vset'] = None
+                    self._scan_put_result(s, h, fr, avg, ovl)
+                    s['hi'] += 1
+                    s['vset'] = None
+                else:
+                    # 没过就丢掉：复核用的 RSSI 是"信道内的总功率"，NFM 12kHz 和
+                    #   AM 9kHz 量出来几乎一样，换个制式再听一遍只是白花一倍时间
+                    #   （实测每个候选 2 秒）。所以要扫哪一类，就在外面把制式设成那一类。
+                    s['hi'] += 1
+                    s['vset'] = None
             return
 
         # ---- 收尾 ----
         if ph == 'done':
             res = s['results']
+            self._set_rate(RTL_RATE)                  # 扫描结束恢复正常收听
             self._squelch_on = getattr(self, '_scan_sq', True)
             self._scan_last = s
             self._scan = None
-            if res:
+            if s.get('keep_hz'):
+                # 用户在列表里点了"设为当前频率"：听他的，别自作主张停在最强信号上
+                self.set_frequency(s['keep_hz'])
+            elif res:
                 best = max(res, key=lambda r: r.get('db') or -999)
                 self.set_frequency(best['freq'])       # 停在最强那个信号上
             else:
@@ -1136,9 +1318,11 @@ class RadioEngine:
         if acc is None:
             return
         c = float(s['wins'][s['wi']])
-        df = RTL_RATE / float(n)
+        rate = float(self._scan_rate or RTL_RATE)
+        df = rate / float(n)
         half = max(1, int(SCAN_STEP_HZ / df / 2.0))
-        ncell = int(SCAN_WIN_SPAN_HZ / SCAN_STEP_HZ / 2.0)
+        win_span = self._scan_win_span()
+        ncell = int(win_span / SCAN_STEP_HZ / 2.0)
         for i in range(-ncell, ncell + 1):
             fq = c + i * SCAN_STEP_HZ
             if fq < s['start_hz'] - 1.0 or fq > s['end_hz'] + 1.0:
@@ -1189,32 +1373,83 @@ class RadioEngine:
 
         hits = []
         cur = None
-        for fq, (d, fpk) in items:
+        for idx, (fq, (d, fpk)) in enumerate(items):
             if d >= thr:
                 w = 10.0 ** (d / 10.0)
+                # 隔着几个格子的低谷不算断开：一个电台的裙边会围着门限上下抖
+                if cur is not None and idx - int(cur['last']) > SCAN_CLUSTER_GAP_CELLS:
+                    hits.append(cur)
+                    cur = None
                 if cur is None:
-                    cur = {'freq': fq, 'db': d, 'w': w, 'wf': w * fq, 'fpk': fpk}
+                    cur = {'freq': fq, 'db': d, 'w': w, 'wf': w * fq, 'fpk': fpk,
+                           'cells': 1, 'last': idx, 'f_lo': fq, 'f_hi': fq}
                 else:
                     cur['w'] += w
                     cur['wf'] += w * fq
+                    cur['cells'] = int(cur.get('cells', 1)) + 1
                     if d > cur['db']:
                         cur['freq'], cur['db'], cur['fpk'] = fq, d, fpk
-            else:
-                if cur is not None:
-                    hits.append(cur)
-                    cur = None
+                cur['last'] = idx
+                cur['f_hi'] = fq
         if cur is not None:
             hits.append(cur)
         for h in hits:
             # 峰值 bin 估计（准）；万一是平的没插出来，退回能量质心
             h['cf'] = h.get('fpk') or (h['wf'] / h['w'] if h['w'] > 0 else h['freq'])
+            h['bw'] = round(float(h.get('cells', 1)) * SCAN_STEP_HZ, 1)   # 门限以上的宽度
+            h['mode'] = self._mode              # 复核时用的制式（下面显示/存信道都用它）
+            # 从峰值格子往两边找 -6dB 边界，得到真实占用带宽
+            step = float(SCAN_STEP_HZ)
+            lim = int(SCAN_OCC_MAX_HZ / step)
+            lvl = float(h['db']) - SCAN_OCC_6DB
+            fpk_f = float(h['freq'])
+            lo_f = hi_f = fpk_f
+            # ★ 不能"碰到第一个低谷就停"：FM 频谱里载波/导频之间有深谷，一停就把
+            #   200kHz 的电台量成 12kHz。取 ±200kHz 内【最远】那个还在 -6dB 以上的格子。
+            for k in range(1, lim + 1):
+                f = fpk_f - k * step
+                v = best.get(f)
+                if v is not None and v[0] >= lvl:
+                    lo_f = f
+            for k in range(1, lim + 1):
+                f = fpk_f + k * step
+                v = best.get(f)
+                if v is not None and v[0] >= lvl:
+                    hi_f = f
+            h['bw6'] = round(hi_f - lo_f + step, 1)
+            if h['bw6'] >= SCAN_WFM_BW6_HZ and (float(h['db']) - floor) >= 12.0:
+                # ★ 宽信号（FM 广播）报【-6dB 占用带的正中】，不报最强格子：
+                #   调制带里最强的那一格随节目内容乱跑（实测能偏 ±75kHz），
+                #   而占用带中心就是电台的载波频率，稳得多。
+                h['cf'] = (lo_f + hi_f) / 2.0
         hits.sort(key=lambda h: -h['db'])
+        # ★ 强信号的占用带里如果还站着别的命中，那是同一个电台的边带碎块
+        #   （实测 95.9 会在 95.82 处再报一条），只留最强的那条。
+        keep = []
+        for h in hits:
+            inside = False
+            for g in keep:
+                if abs(h['freq'] - g['freq']) <= self._scan_tol(g.get('bw6') or g.get('bw')):
+                    inside = True
+                    break
+            if not inside:
+                keep.append(h)
+        if len(keep) != len(hits):
+            print('LBJ: 合并同一信号 %d 条 -> %d 条' % (len(hits), len(keep)), flush=True)
+        hits = keep
         s['hits'] = hits[:SCAN_MAX_RESULTS]
+        self._set_rate(RTL_RATE)     # 复核要走正常 DSP，那个是按 960k 搭的
         s['phase'] = 'verify'
         s['hi'] = 0
         s['vset'] = None
+        # 速度实测：一趟用了多久、跑掉的块数和采样数（采样数/时间 = 数据源真实速率）
+        el = max(1e-3, time.time() - float(s.get('sweep_t0') or time.time()))
+        nb = max(1, int(s.get('blk_n', 0)))
+        ns = int(s.get('smp_n', 0))
         print('LBJ: 扫描完成 %d 格（%d 格有效）  底噪 %.1f  门限 %.1f（底噪+%.1f）  候选 %d'
-              % (len(m), len(items), floor, thr, margin, len(s['hits'])), flush=True)
+              '  用时 %.1fs/趟（%d 块 %.0f kS/s 平均块 %d）'
+              % (len(m), len(items), floor, thr, margin, len(s['hits']),
+                 el, nb, ns / el / 1000.0, ns // nb), flush=True)
 
 
     def _scan_snapshot(self):
@@ -1231,7 +1466,7 @@ class RadioEngine:
             'start_hz': s.get('start_hz'), 'end_hz': s.get('end_hz'),
             'progress': round(min(1.0, prog), 3),
             'floor': s.get('floor'), 'thr': s.get('thr'),
-            'margin': s.get('margin'),
+            'margin': s.get('margin'), 'rate': int(self._scan_rate or RTL_RATE),
             'n_ch': s.get('n_ch', 0),
             'pass': int(s.get('pass', 0)),
             'n_hit': len(s.get('hits') or []),
