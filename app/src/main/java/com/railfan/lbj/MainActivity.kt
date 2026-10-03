@@ -174,19 +174,19 @@ private const val FULL_STOP_DELAY_MS = 120000L
     @Volatile private var radioPolling = false
     private var fgOn = false
     private var radioScan = false
-    // 对频（扫描找频）：面板 + 结果表
+    // 扫描（找频）：面板 + 结果表
     private var scanDialog: AlertDialog? = null
     private var scanStatus: TextView? = null
     private var scanAdapter: ScanAdapter? = null
     private var scanResults: JSONArray = JSONArray()
     private var scanActive = false
-    private var scanReadCur = true
     private var scanFine = true
     // PPM 校准
     private var calibActive = false
     private var calibDialog: AlertDialog? = null
     private var calibMsg: TextView? = null
-    // 从对频结果存信道时，真正的写入值放这里（复用 writeChannel 的覆盖确认流程）
+    private var autocalActive = false
+    // 从扫描结果存信道时，真正的写入值放这里（复用 writeChannel 的覆盖确认流程）
     private var pendingWrite: RadioChannel? = null
     private val radioSteps = doubleArrayOf(100e3, 25e3, 12.5e3, 5e3, 1e3)
     private var radioStepIdx = 2
@@ -1191,16 +1191,14 @@ private const val FULL_STOP_DELAY_MS = 120000L
         updateRadioButtons()
     }
 
-    /** 对频面板：进度 + 结果表（结果一到就刷新） */
+    /** 扫描面板：进度 + 结果表（结果一到就刷新） */
     private fun renderScan(sc: JSONObject?) {
         if (sc == null) return
         val res = sc.optJSONArray("results") ?: JSONArray()
         val act = sc.optBoolean("active", false)
         if (act) {
             val ph = when (sc.optString("phase", "")) {
-                "tonecur" -> "读当前频率亚音"
                 "verify" -> "复核信号"
-                "tone" -> "读亚音"
                 "window", "discard", "measure" -> "扫描中"
                 else -> "准备"
             }
@@ -1218,11 +1216,11 @@ private const val FULL_STOP_DELAY_MS = 120000L
             updateRadioButtons()
             val pb = scanDialog?.getButton(AlertDialog.BUTTON_POSITIVE)
             if (pb != null) {
-                pb.text = "重新对频"
-                pb.setOnClickListener { scanDialog?.dismiss(); startScan(scanReadCur, scanFine) }
+                pb.text = "重新扫描"
+                pb.setOnClickListener { scanDialog?.dismiss(); startScan(scanFine) }
             }
             scanStatus?.text = String.format(
-                Locale.US, "对频完成：找到 %d 个信号（已停在最强那个上）\n点下面任意一行可存成信道。",
+                Locale.US, "扫描完成：找到 %d 个信号（已停在最强那个上）\n点下面任意一行可存成信道。",
                 res.length()
             )
             if (res.length() == 0) toast("这 10 MHz 里没扫到信号")
@@ -1256,8 +1254,8 @@ private const val FULL_STOP_DELAY_MS = 120000L
         // 只写数值，不写"步进"两个字：长了会折行，把这一排撑高导致错位
         findViewById<Button>(R.id.btnStep).text =
             String.format(Locale.US, "%.4g kHz", radioSteps[radioStepIdx] / 1000.0)
-        findViewById<Button>(R.id.btnScan).text = if (radioScan) "停止对频" else "对频"
-        // 对频期间禁掉会跟扫描抢调谐的那几颗按钮（对频自己那颗留着当"停止"用）
+        findViewById<Button>(R.id.btnScan).text = if (radioScan) "停止扫描" else "扫描"
+        // 扫描期间禁掉会跟扫描抢调谐的那几颗按钮（扫描自己那颗留着当"停止"用）
         for (id in arrayOf(R.id.btnDown, R.id.btnUp, R.id.btnStep, R.id.btnMode, R.id.btnCtcss)) {
             findViewById<Button>(id).isEnabled = tune && !radioScan
         }
@@ -1273,7 +1271,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
             //   不然会出现"频率显示 438.5150，信道栏还写着 457.0000"这种自相矛盾的画面
             //   （真机上就是这么暴露的：进收音机时没初始化信道栏，留的是布局里的默认文字）。
             radioFreqHz = hz
-            // ★ 对频期间引擎会不停改频（复核/读亚音），这不是用户在调谐 ——
+            // ★ 扫描期间引擎会不停改频（复核命中点），这不是用户在调谐 ——
             //   不挡住的话会把当前信道的频率悄悄改掉。
             if (channels.isNotEmpty() && !radioVfo && !radioScan) {
                 val c = channels[curChannel]
@@ -1307,11 +1305,12 @@ private const val FULL_STOP_DELAY_MS = 120000L
             spectrumRadio.update(v, -1f, 0.5f)
         }
 
-        // ★ 对频面板必须在这里刷新：轮询调的是 renderRadio()，
+        // ★ 扫描面板必须在这里刷新：轮询调的是 renderRadio()，
         //   applyRadioUi() 只在进收音机时调一次 —— 放错地方的后果就是
         //   面板一直卡在"准备中…"、结果表空白（真机上就是这么暴露的）。
         renderScan(o.optJSONObject("scan"))
         renderCalib(o.optJSONObject("calib"))
+        renderAutocal(o.optJSONObject("autocal"))
     }
 
     // ---------------------------------------------------------- 调谐操作
@@ -1554,7 +1553,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
 
     private fun doWriteChannel(idx: Int) {
         val old = channels[idx]
-        val src = pendingWrite            // 来自对频结果时用它，否则用当前收听值
+        val src = pendingWrite            // 来自扫描结果时用它，否则用当前收听值
         pendingWrite = null
         channels[idx] = RadioChannel(
             name = old.name,
@@ -1655,9 +1654,9 @@ private const val FULL_STOP_DELAY_MS = 120000L
     private var radioScanRunnable: Runnable? = null
 
     /**
-     * 对频（扫描找频）。
+     * 扫描（找频）。
      *
-     * 用途：找到附近那个台的【频率 + 亚音】，然后去把自己的对讲机设成一样的。
+     * 用途：把这个范围里有信号的频点找出来，列成一张表，点一行就能存成信道。
      * 本机是纯接收，不参与通话。
      *
      * ★ 扫描在 Python 引擎里跑（FFT 一次算一个窗口的 64 个格子），
@@ -1669,13 +1668,11 @@ private const val FULL_STOP_DELAY_MS = 120000L
             stopScan()
             return
         }
-        // 先问两个可选项
         val pad = (resources.displayMetrics.density * 20).toInt()
         val col = LinearLayout(this)
         col.orientation = LinearLayout.VERTICAL
         col.setPadding(pad, pad / 2, pad, 0)
-        val cCur = check(col, "先读当前收听频率的亚音", prefs.getBoolean("scan_readcur", true))
-        val cFine = check(col, "锁定后用频谱重心自动微调频率", prefs.getBoolean("scan_fine", true))
+        val cFine = check(col, "用峰值自动微调频率", prefs.getBoolean("scan_fine", true))
         val tip = TextView(this)
         tip.text = String.format(
             Locale.US,
@@ -1686,16 +1683,14 @@ private const val FULL_STOP_DELAY_MS = 120000L
         tip.setPadding(0, pad / 2, 0, 0)
         col.addView(tip)
         AlertDialog.Builder(this)
-            .setTitle("对频（找频率 + 读亚音）")
+            .setTitle("扫描（找本范围内有信号的频点）")
             .setView(col)
             .setPositiveButton("开始") { _, _ ->
-                prefs.edit()
-                    .putBoolean("scan_readcur", cCur.isChecked)
-                    .putBoolean("scan_fine", cFine.isChecked).apply()
-                startScan(cCur.isChecked, cFine.isChecked)
+                prefs.edit().putBoolean("scan_fine", cFine.isChecked).apply()
+                startScan(cFine.isChecked)
             }
             // PPM 校准单独一个入口：它不扫描，只是"停下来量一下载波偏了多少"
-            .setNeutralButton("测 PPM") { _, _ -> startCalib() }
+            .setNeutralButton("PPM 校准") { _, _ -> showCalibChooser() }
             .setNegativeButton(R.string.ch_cancel, null)
             .show()
     }
@@ -1707,6 +1702,92 @@ private const val FULL_STOP_DELAY_MS = 120000L
      * 峰值和质心整体拉高约 +2kHz（95.9 读成 95.9023 就是这么来的），
      * 而音频没有直流分量，所以鉴频直流只反映载波偏了多少。实测精度 ±15Hz。
      */
+    /** PPM 校准的两个入口：自动（自己找广播台）/ 手动（用当前正在听的台） */
+    private fun showCalibChooser() {
+        AlertDialog.Builder(this)
+            .setTitle("PPM 校准")
+            .setItems(arrayOf(
+                "自动：自己找本地 FM 广播台",
+                "手动：用当前正在听的台"
+            )) { _, w ->
+                if (w == 0) startAutocal() else startCalib()
+            }
+            .setNegativeButton(R.string.ch_cancel, null)
+            .show()
+    }
+
+    /**
+     * 自动 PPM 校准：扫 FM 段找最强的台 → 吸附到 100kHz 栅格 → 量载波频偏
+     * → 应用 → 复测。全程自己走完，只看结果。
+     *
+     * FC0013 这类便宜棒晶振普遍偏得多，所以这个功能是"新装就该点一下"的东西。
+     */
+    private fun startAutocal() {
+        val re = radioEngine ?: return
+        Thread {
+            try {
+                re.callAttr("start_autocalib")
+            } catch (t: Throwable) {
+                main.post { toast("启动失败：" + (t.message ?: "")) }
+                return@Thread
+            }
+            main.post {
+                autocalActive = true
+                val tv = TextView(this)
+                val pad = (resources.displayMetrics.density * 20).toInt()
+                tv.setPadding(pad, pad, pad, pad)
+                tv.text = "正在自动校准…\n先扫 FM 段找广播台"
+                calibMsg = tv
+                calibDialog?.dismiss()
+                calibDialog = AlertDialog.Builder(this)
+                    .setTitle("自动 PPM 校准")
+                    .setView(tv)
+                    .setNegativeButton("取消") { _, _ ->
+                        Thread { try { re.callAttr("stop_autocalib") } catch (_: Throwable) { } }.start()
+                        autocalActive = false
+                    }
+                    .create()
+                calibDialog?.show()
+            }
+        }.start()
+    }
+
+    private fun renderAutocal(c: JSONObject?) {
+        if (c == null || !autocalActive) return
+        if (!c.optBoolean("done", false)) {
+            calibMsg?.text = String.format(
+                Locale.US, "%s\n%.4f MHz   完成 %.0f%%",
+                c.optString("msg", "校准中…"),
+                (if (c.optDouble("scan_hz", 0.0) > 0) c.optDouble("scan_hz") else c.optDouble("freq", radioFreqHz)) / 1e6,
+                c.optDouble("progress", 0.0) * 100
+            )
+            return
+        }
+        autocalActive = false
+        calibDialog?.dismiss()
+        if (c.isNull("ppm_suggest")) {
+            AlertDialog.Builder(this)
+                .setTitle("自动 PPM 校准")
+                .setMessage(c.optString("msg", "没成功"))
+                .setPositiveButton("知道了", null).show()
+            return
+        }
+        val sug = c.optInt("ppm_suggest", 0)
+        prefs.edit().putInt("ppm", sug).apply()      // 引擎那边已经应用，这里落盘
+        AlertDialog.Builder(this)
+            .setTitle("自动 PPM 校准完成")
+            .setMessage(String.format(
+                Locale.US,
+                "校准台：%.4f MHz（FM 广播，锁 GPS）\n\n" +
+                    "应用前载波偏 %+.0f Hz\n已应用 ppm = %d\n复测残差 %+.0f Hz\n\n" +
+                    "残差接近 0 就说明准了；这个值只跟这根棒有关，换位置/换电脑都一样。",
+                c.optDouble("freq", radioFreqHz) / 1e6,
+                c.optDouble("meas_hz", 0.0), sug, c.optDouble("resid_hz", 0.0)
+            ))
+            .setPositiveButton("好", null)
+            .show()
+    }
+
     private fun startCalib() {
         val re = radioEngine ?: return
         if (radioMode == "AM") {
@@ -1771,9 +1852,8 @@ private const val FULL_STOP_DELAY_MS = 120000L
             .show()
     }
 
-    private fun startScan(readCur: Boolean, fine: Boolean) {
+    private fun startScan(fine: Boolean) {
         val re = radioEngine ?: return
-        scanReadCur = readCur
         scanFine = fine
         scanResults = JSONArray()
         scanActive = true
@@ -1782,9 +1862,9 @@ private const val FULL_STOP_DELAY_MS = 120000L
         showScanDialog()
         Thread {
             try {
-                re.callAttr("start_scan", 10e6, readCur, fine)
+                re.callAttr("start_scan", 10e6, fine)
             } catch (t: Throwable) {
-                main.post { toast("对频启动失败：" + (t.message ?: "")) }
+                main.post { toast("扫描启动失败：" + (t.message ?: "")) }
             }
         }.start()
     }
@@ -1818,15 +1898,15 @@ private const val FULL_STOP_DELAY_MS = 120000L
             (resources.displayMetrics.density * 260).toInt()
         ))
         scanDialog = AlertDialog.Builder(this)
-            .setTitle("对频结果（点一行 = 存到信道）")
+            .setTitle("扫描结果（点一行 = 存到信道）")
             .setView(col)
-            .setPositiveButton("停止对频") { _, _ -> stopScan() }
+            .setPositiveButton("停止扫描") { _, _ -> stopScan() }
             .setNegativeButton("关闭", null)
             .create()
         scanDialog?.show()
     }
 
-    /** 结果表的一行：序号 + 频率 + 亚音/强度（复用信道行的布局） */
+    /** 结果表的一行：序号 + 频率 + 制式/强度（复用信道行的布局） */
     private inner class ScanAdapter : BaseAdapter() {
         override fun getCount(): Int = scanResults.length()
         override fun getItem(position: Int): Any = position
@@ -1835,15 +1915,13 @@ private const val FULL_STOP_DELAY_MS = 120000L
             val v = convertView ?: layoutInflater.inflate(R.layout.view_ch_row, parent, false)
             val r = scanResults.optJSONObject(position) ?: JSONObject()
             val f = r.optDouble("freq", 0.0)
-            val tone = r.optDouble("tone", 0.0)
             val cur = r.optBoolean("cur", false)
             v.findViewById<TextView>(R.id.chIndex).text = String.format(Locale.US, "%02d", position + 1)
             v.findViewById<TextView>(R.id.chName).text =
                 String.format(Locale.US, "%.4f MHz%s", f / 1e6, if (cur) "  （当前收听）" else "")
             val ovl = r.optBoolean("ovl", false)
             v.findViewById<TextView>(R.id.chInfo).text = String.format(
-                Locale.US, "%s   %s   %.0f dB%s", radioMode,
-                if (tone > 0) "亚音 " + RadioChannel.ctcssLabel(tone) else "无亚音",
+                Locale.US, "%s   %.0f dB%s", radioMode,
                 r.optDouble("db", 0.0),
                 if (ovl) "   ⚠过载" else ""
             )
@@ -1857,16 +1935,13 @@ private const val FULL_STOP_DELAY_MS = 120000L
     private fun saveScanResult(i: Int) {
         val r = scanResults.optJSONObject(i) ?: return
         val f = r.optDouble("freq", 0.0)
-        val tone = r.optDouble("tone", 0.0)
         if (f <= 0.0) return
-        pendingWrite = RadioChannel("", f, radioMode, radioSteps[radioStepIdx], tone)
+        // 亚音未知（扫描不再读亚音），先存 0，要开亚音在信道编辑里填
+        pendingWrite = RadioChannel("", f, radioMode, radioSteps[radioStepIdx], 0.0)
         if (channels.isEmpty()) channels = RadioChannel.load(prefs)
         AlertDialog.Builder(this)
             .setTitle(
-                String.format(
-                    Locale.US, "存到信道 · %.4f MHz%s", f / 1e6,
-                    if (tone > 0) "   亚音 " + RadioChannel.ctcssLabel(tone) else ""
-                )
+                String.format(Locale.US, "存到信道 · %.4f MHz", f / 1e6)
             )
             .setAdapter(ChAdapter()) { _, which -> writeChannel(which) }
             .setNegativeButton(R.string.ch_cancel, null)
