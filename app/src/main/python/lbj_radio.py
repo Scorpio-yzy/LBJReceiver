@@ -90,6 +90,11 @@ SCAN_VERIFY_S = 0.90          # 命中后复核驻留（含调谐器稳定时间
 SCAN_VERIFY_SKIP = 10         # 复核前先跳过这么多块（等 PLL 稳，别把换频瞬间算进去）
 SCAN_TONE_S = 1.15            # 读亚音驻留（要 1 秒窗才分得开 67.0/69.3）
 SCAN_MAX_RESULTS = 40         # 结果表上限
+# 门限 = 底噪 + margin。margin 默认按静噪档位推，用户可以在界面上手动指定
+# （只想留强台就调大，怕漏弱信号就调小）。上下限是防手滑的护栏。
+SCAN_MARGIN_DEFAULT_DB = 7.0  # 界面上默认填的余量
+SCAN_MARGIN_MIN_DB = 2.0      # 再小就是噪声自己了
+SCAN_MARGIN_MAX_DB = 40.0     # 再大连本地强台都进不来
 # 电平接近满量程就说明前端被打饱和了：此时频率会偏、亚音会被削掉、
 # 还会冒出一堆互调假信号 —— 必须明确告诉用户"这次读数不可信"。
 SCAN_OVERLOAD_DB = -3.0       # 比这更响就认为过载（0 dB = 满量程）
@@ -327,10 +332,17 @@ class RadioEngine:
                 pass
 
     def set_ppm(self, ppm):
+        """设频偏校正（ppm）。
+
+        ★ 必须同步到参考实现的共享状态 R._g2['ppm']：
+          预警器的 _reader_task 在【重连时】会用 _g2['ppm'] 重新下发一次校正值。
+          只改自己这边的话，收音机里刚校准好的 ppm 会在预警器重连时被旧值覆盖。
+        """
         self._ppm = int(ppm)
+        R._g2['ppm'] = self._ppm
         if self._src is not None:
             try:
-                self._src._ah(self._ppm)
+                self._src._ah(self._ppm)      # librtlsdr 会立刻重新调谐生效
             except Exception:
                 pass
 
@@ -438,7 +450,7 @@ class RadioEngine:
                     self._autocal = None
                 n += len(iq)
                 continue
-            # 扫描扫描期间走扫描状态机（它自己决定要不要出声）
+            # 扫描期间走扫描状态机（它自己决定要不要出声）
             if self._scan is not None:
                 try:
                     self._scan_tick(iq)
@@ -654,8 +666,11 @@ class RadioEngine:
         except Exception:
             pass
 
-    def start_scan(self, span_hz=None, fine=True):
-        """开始扫描：从当前频率向上扫 span_hz，把有信号的频点列出来。返回 True。"""
+    def start_scan(self, span_hz=None, fine=True, margin_db=None):
+        """开始扫描：从当前频率向上扫 span_hz，把有信号的频点列出来。返回 True。
+
+        margin_db：判定门限要比底噪高多少 dB（None = 按静噪档位自动推）。
+        """
         span = float(span_hz or SCAN_SPAN_DEFAULT_HZ)
         f0 = float(self._freq)
         nwin = max(1, int(np.ceil(span / SCAN_WIN_SPAN_HZ)))
@@ -674,19 +689,64 @@ class RadioEngine:
             'fine': bool(fine),
             'discard_left': 0, 'integ_left': 0, 'acc': [],
             'meas': [], 'hits': [], 'hi': 0, 'results': [],
-            'floor': None, 'thr': None, 'left': SCAN_TONE_S,
-            'n_ch': 0, 'stop': False, 'vset': None, 'rssi_acc': [],
+            'floor': None, 'thr': None,
+            'margin': None if margin_db is None else float(margin_db),
+            'left': SCAN_TONE_S,
+            'n_ch': 0, 'stop': False, 'vset': None, 'rssi_acc': [], 'pass': 0,
         }
         self._squelch_on = False
         self._open = False
         self._silent_ms = 0.0
-        print('LBJ: 扫描开始 %.4f~%.4f MHz（%d 窗口，自动微调=%s）'
-              % (f0 / 1e6, (f0 + span) / 1e6, nwin, fine), flush=True)
+        print('LBJ: 扫描开始 %.4f~%.4f MHz（%d 窗口，自动微调=%s，门限%s）'
+              % (f0 / 1e6, (f0 + span) / 1e6, nwin, fine,
+                 '自动' if margin_db is None else '底噪+%.0f dB' % float(margin_db)),
+              flush=True)
         return True
 
     def stop_scan(self):
         if self._scan is not None:
             self._scan['stop'] = True
+        return True
+
+    @staticmethod
+    def _margin_of(d):
+        """取用户设的门限余量；没设过（或值离谱）返回 None，由调用方退回自动值。"""
+        v = (d or {}).get('margin')
+        if v is None:
+            return None
+        try:
+            return max(SCAN_MARGIN_MIN_DB, min(SCAN_MARGIN_MAX_DB, float(v)))
+        except Exception:
+            return None
+
+    def set_scan_margin(self, db):
+        """手动改扫描门限（界面上的"门限"输入框），立刻生效，不用重扫。
+
+        改门限时顺手把已经扫到的结果按新门限过一遍 —— 用户调高门限就是想
+        把弱信号从表里去掉，让它们赖在表里就自相矛盾了。
+        """
+        try:
+            v = max(SCAN_MARGIN_MIN_DB, min(SCAN_MARGIN_MAX_DB, float(db)))
+        except Exception:
+            return False
+        for s in (self._scan, self._scan_last):
+            if s is None:
+                continue
+            s['margin'] = v
+            fl = s.get('floor')
+            if fl is None:
+                continue
+            thr = float(fl) + (self._margin_of(s) or 0.0)
+            s['thr'] = round(thr, 1)
+            res = s.get('results') or []
+            keep = [r for r in res if float(r.get('db') or -999.0) >= thr]
+            if len(keep) != len(res):
+                s['results'] = keep
+                print('LBJ: 扫描门限 → 底噪+%.1f dB（%.1f dB），滤掉 %d 个弱信号，剩 %d 个'
+                      % (v, thr, len(res) - len(keep), len(keep)), flush=True)
+            else:
+                print('LBJ: 扫描门限 → 底噪+%.1f dB（%.1f dB）'
+                      % (v, thr), flush=True)
         return True
 
     # ------------------------------------------------------------ 扫描状态机
@@ -733,8 +793,16 @@ class RadioEngine:
 
         # ---- 复核候选：软件调过去，驻留几百毫秒顺便出声 ----
         if ph == 'verify':
-            if s['stop'] or s['hi'] >= len(s['hits']):
+            if s['stop']:
                 s['phase'] = 'done'
+                return
+            if s['hi'] >= len(s['hits']):
+                # ★ 一趟验收完就【接着扫下一趟】，不自己结束 ——
+                #   用户要的是"不手动停就一直扫，扫到的都记在列表里"。
+                s['pass'] = int(s.get('pass', 0)) + 1
+                s['meas'] = []
+                s['wi'] = 0
+                s['phase'] = 'window'
                 return
             h = s['hits'][s['hi']]
             if s.get('vset') != h['freq']:
@@ -764,11 +832,35 @@ class RadioEngine:
                     if s['fine'] and h.get('cf'):
                         h['freq'] = float(h['cf'])      # 用峰值 bin 做微调
                     ovl = avg > SCAN_OVERLOAD_DB
-                    s['results'].append({'freq': round(float(h['freq']), 1),
-                                         'db': round(avg, 1), 'cur': False, 'ovl': ovl})
-                    print('LBJ: 扫描命中 %.4f MHz  %.1f dB%s'
-                          % (h['freq'] / 1e6, avg,
-                             '  ★过载：频率不可信，请降低增益或拉远距离' if ovl else ''), flush=True)
+                    fr = round(float(h['freq']), 1)
+                    # 去重：同一个信号（1.5 格内）只留一条；重复扫到就更新强度
+                    ex = None
+                    for r0 in s['results']:
+                        if abs(r0['freq'] - fr) <= SCAN_STEP_HZ * 1.5:
+                            ex = r0
+                            break
+                    if ex is not None:
+                        # ★ 同一个信号每再扫到一次，就把它和已有估计【平均】一次：
+                        #   单次峰值估计受调制影响会偏（实测 95.9 会读成 95.9123），
+                        #   多趟平均会一点点往真值收敛，越扫越准。
+                        n0 = int(ex.get('n', 1))
+                        n1 = min(n0, 30)      # 上限：老数据不能永远压着，环境变了要能跟上
+                        ex['freq'] = round((ex['freq'] * n1 + fr) / (n1 + 1), 1)
+                        ex['n'] = n0 + 1
+                        m0 = min(n0, 9)
+                        ex['db'] = round((ex['db'] * m0 + avg) / (m0 + 1), 1)
+                        ex['ovl'] = ovl
+                        if n0 % 5 == 0:
+                            print('LBJ: 复扫 %.4f MHz -> 修正为 %.4f MHz（第 %d 次，共 %d 个）'
+                                  % (fr / 1e6, ex['freq'] / 1e6, ex['n'], len(s['results'])),
+                                  flush=True)
+                    elif len(s['results']) < SCAN_MAX_RESULTS:
+                        s['results'].append({'freq': fr, 'db': round(avg, 1), 'n': 1,
+                                             'cur': False, 'ovl': ovl})
+                        print('LBJ: 扫描命中 %.4f MHz  %.1f dB%s'
+                              % (h['freq'] / 1e6, avg,
+                                 '  ★过载：频率不可信，请降低增益或拉远距离' if ovl else ''),
+                              flush=True)
                 s['hi'] += 1
                 s['vset'] = None
             return
@@ -784,7 +876,8 @@ class RadioEngine:
                 self.set_frequency(best['freq'])       # 停在最强那个信号上
             else:
                 self.set_frequency(s['start_hz'])
-            print('LBJ: 扫描结束，%d 个信号，%d 格' % (len(res), s['n_ch']), flush=True)
+            print('LBJ: 扫描结束（扫了 %d 趟），共 %d 个信号'
+              % (int(s.get('pass', 0)) + 1, len(res)), flush=True)
 
 
     # ------------------------------------------------------------ 自动 PPM 校准
@@ -1089,7 +1182,7 @@ class RadioEngine:
         items = sorted(best.items())
         dbs = np.array([v[0] for _, v in items], dtype=np.float64)
         floor = float(np.percentile(dbs, 25))
-        margin = max(SCAN_MIN_MARGIN_DB, float(self._squelch_db) * 0.6)
+        margin = self._margin_of(s) or max(SCAN_MIN_MARGIN_DB, float(self._squelch_db) * 0.6)
         thr = floor + margin
         s['floor'] = round(floor, 1)
         s['thr'] = round(thr, 1)
@@ -1120,8 +1213,8 @@ class RadioEngine:
         s['phase'] = 'verify'
         s['hi'] = 0
         s['vset'] = None
-        print('LBJ: 扫描完成 %d 格（%d 格有效）  底噪 %.1f  门限 %.1f  候选 %d'
-              % (len(m), len(items), floor, thr, len(s['hits'])), flush=True)
+        print('LBJ: 扫描完成 %d 格（%d 格有效）  底噪 %.1f  门限 %.1f（底噪+%.1f）  候选 %d'
+              % (len(m), len(items), floor, thr, margin, len(s['hits'])), flush=True)
 
 
     def _scan_snapshot(self):
@@ -1138,7 +1231,9 @@ class RadioEngine:
             'start_hz': s.get('start_hz'), 'end_hz': s.get('end_hz'),
             'progress': round(min(1.0, prog), 3),
             'floor': s.get('floor'), 'thr': s.get('thr'),
+            'margin': s.get('margin'),
             'n_ch': s.get('n_ch', 0),
+            'pass': int(s.get('pass', 0)),
             'n_hit': len(s.get('hits') or []),
             'results': s.get('results') or [],
         }

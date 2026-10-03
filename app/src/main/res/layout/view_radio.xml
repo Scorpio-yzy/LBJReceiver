@@ -67,8 +67,10 @@
             android:textSize="22sp"
             android:textStyle="bold" />
 
-        <!-- 频率 + MHz 同一行 -->
+        <!-- 频率 + MHz 同一行。数字要正对屏幕中心，所以左内边距由代码按 MHz 实测宽度设置
+             （见 MainActivity.centerFreqRow）—— 写死 dp 换字体/换语言会差几像素。 -->
         <LinearLayout
+            android:id="@+id/freqRow"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
@@ -79,7 +81,6 @@
                 android:id="@+id/tvFreq"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:minWidth="205dp"
                 android:fontFamily="monospace"
                 android:gravity="center"
                 android:maxLines="1"
@@ -89,6 +90,7 @@
                 android:textStyle="bold" />
 
             <TextView
+                android:id="@+id/tvMhzUnit"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_marginStart="6dp"

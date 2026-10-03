@@ -143,6 +143,8 @@ private const val FULL_STOP_DELAY_MS = 120000L
     private lateinit var mainRoot: View
     private lateinit var radioRoot: View
     private lateinit var tvFreq: TextView
+    private lateinit var tvMhzUnit: TextView
+    private lateinit var freqRow: LinearLayout
     private lateinit var keypad: View
     private lateinit var tvKeypadTip: TextView
     // 自制数字键盘的输入缓冲。输入内容直接显示在频率大字上，所见即所得。
@@ -181,6 +183,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
     private var scanResults: JSONArray = JSONArray()
     private var scanActive = false
     private var scanFine = true
+    private var scanMargin = 7.0        // 门限余量（dB，相对底噪）；扫描中也能改
     // PPM 校准
     private var calibActive = false
     private var calibDialog: AlertDialog? = null
@@ -203,6 +206,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
         setContentView(R.layout.activity_main)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        scanMargin = prefs.getFloat("scan_margin", 7f).toDouble()
         // 内置驱动出错时 SdrException 会去 StrRes 取文案；不设就全是空串（原驱动在
         // RtlSdrApplication.onCreate 里设，本 App 的 Application 是 Chaquopy 的，设不了）。
         StrRes.res = resources
@@ -231,6 +235,8 @@ private const val FULL_STOP_DELAY_MS = 120000L
         mainRoot = findViewById(R.id.mainRoot)
         radioRoot = findViewById(R.id.radioRoot)
         tvFreq = findViewById(R.id.tvFreq)
+        tvMhzUnit = findViewById(R.id.tvMhzUnit)
+        freqRow = findViewById(R.id.freqRow)
         keypad = findViewById(R.id.keypad)
         tvKeypadTip = findViewById(R.id.tvKeypadTip)
         setupKeypad()
@@ -1204,10 +1210,12 @@ private const val FULL_STOP_DELAY_MS = 120000L
             }
             val fTxt = if (sc.isNull("floor")) "—" else String.format(Locale.US, "%.0f", sc.optDouble("floor"))
             val tTxt = if (sc.isNull("thr")) "—" else String.format(Locale.US, "%.0f", sc.optDouble("thr"))
+            val mTxt = if (sc.isNull("margin")) ""
+                        else String.format(Locale.US, "（底噪+%.0f）", sc.optDouble("margin"))
             scanStatus?.text = String.format(
-                Locale.US, "%s   %.4f MHz   完成 %.0f%%\n底噪 %s dB   门限 %s dB   已找到 %d 个",
-                ph, sc.optDouble("cur_hz", radioFreqHz) / 1e6, sc.optDouble("progress", 0.0) * 100,
-                fTxt, tTxt, res.length()
+                Locale.US, "%s（第 %d 趟）   %.4f MHz\n底噪 %s dB   门限 %s dB%s   已找到 %d 个",
+                ph, sc.optInt("pass", 0) + 1, sc.optDouble("cur_hz", radioFreqHz) / 1e6,
+                fTxt, tTxt, mTxt, res.length()
             )
         } else if (scanActive) {
             // 引擎那边刚结束
@@ -1217,15 +1225,16 @@ private const val FULL_STOP_DELAY_MS = 120000L
             val pb = scanDialog?.getButton(AlertDialog.BUTTON_POSITIVE)
             if (pb != null) {
                 pb.text = "重新扫描"
-                pb.setOnClickListener { scanDialog?.dismiss(); startScan(scanFine) }
+                pb.setOnClickListener { scanDialog?.dismiss(); startScan(scanFine, scanMargin) }
             }
             scanStatus?.text = String.format(
-                Locale.US, "扫描完成：找到 %d 个信号（已停在最强那个上）\n点下面任意一行可存成信道。",
+                Locale.US, "扫描已停止：共找到 %d 个信号（已停在最强那个上）\n点下面任意一行可存成信道。",
                 res.length()
             )
             if (res.length() == 0) toast("这 10 MHz 里没扫到信号")
         }
-        if (res.length() != scanResults.length()) {
+        // 按内容比，不按长度比：扫描中调门限会【删掉】几行，长度可能碰巧不变
+        if (res.toString() != scanResults.toString()) {
             scanResults = res
             scanAdapter?.notifyDataSetChanged()
         }
@@ -1656,7 +1665,8 @@ private const val FULL_STOP_DELAY_MS = 120000L
     /**
      * 扫描（找频）。
      *
-     * 用途：把这个范围里有信号的频点找出来，列成一张表，点一行就能存成信道。
+     * 用途：不停扫这个范围，把有信号的频点都记进一张表，点一行就能存成信道。
+     * ★ 它【不自己停】—— 只有用户点【停止扫描】才结束（一趟扫完接着下一趟）。
      * 本机是纯接收，不参与通话。
      *
      * ★ 扫描在 Python 引擎里跑（FFT 一次算一个窗口的 64 个格子），
@@ -1673,11 +1683,19 @@ private const val FULL_STOP_DELAY_MS = 120000L
         col.orientation = LinearLayout.VERTICAL
         col.setPadding(pad, pad / 2, pad, 0)
         val cFine = check(col, "用峰值自动微调频率", prefs.getBoolean("scan_fine", true))
+        // 门限：判定"这里有没有信号"的分界 = 底噪 + 这个余量。
+        // 调大只留强台（滤掉弱信号），调小一个不漏；扫描中还能再改（点结果窗里的「门限」）。
+        val eMargin = numField(
+            col, "门限：高出底噪多少 dB 才算信号（调大滤掉弱信号）",
+            String.format(Locale.US, "%.0f", prefs.getFloat("scan_margin", 7f))
+        )
         val tip = TextView(this)
         tip.text = String.format(
             Locale.US,
-            "扫描范围：从当前 %.4f MHz 向上 %d MHz\n结果会列成一张表，点某一行即可存成信道。",
-            radioFreqHz / 1e6, 10
+            "范围：从当前 %s MHz 向上 %d MHz\n" +
+                "扫描：一直扫，扫到的都往表里加，点【停止扫描】才结束。\n" +
+                "门限：默认 7 dB。底噪 -55 就是 -48 dB 以上才算信号；嫌杂音多就填 12、15。",
+            fmtMhz(radioFreqHz), 10
         )
         tip.setTextColor(getColor(R.color.dim))
         tip.setPadding(0, pad / 2, 0, 0)
@@ -1686,8 +1704,11 @@ private const val FULL_STOP_DELAY_MS = 120000L
             .setTitle("扫描（找本范围内有信号的频点）")
             .setView(col)
             .setPositiveButton("开始") { _, _ ->
-                prefs.edit().putBoolean("scan_fine", cFine.isChecked).apply()
-                startScan(cFine.isChecked)
+                // 空着或写乱了就退回默认 7 dB，不让一个笔误把扫描卡住
+                val mg = eMargin.text.toString().trim().toFloatOrNull() ?: 7f
+                prefs.edit().putBoolean("scan_fine", cFine.isChecked)
+                    .putFloat("scan_margin", mg).apply()
+                startScan(cFine.isChecked, mg.toDouble())
             }
             // PPM 校准单独一个入口：它不扫描，只是"停下来量一下载波偏了多少"
             .setNeutralButton("PPM 校准") { _, _ -> showCalibChooser() }
@@ -1852,9 +1873,10 @@ private const val FULL_STOP_DELAY_MS = 120000L
             .show()
     }
 
-    private fun startScan(fine: Boolean) {
+    private fun startScan(fine: Boolean, marginDb: Double = 7.0) {
         val re = radioEngine ?: return
         scanFine = fine
+        scanMargin = marginDb
         scanResults = JSONArray()
         scanActive = true
         radioScan = true
@@ -1862,12 +1884,13 @@ private const val FULL_STOP_DELAY_MS = 120000L
         showScanDialog()
         Thread {
             try {
-                re.callAttr("start_scan", 10e6, fine)
+                re.callAttr("start_scan", 10e6, fine, marginDb)
             } catch (t: Throwable) {
                 main.post { toast("扫描启动失败：" + (t.message ?: "")) }
             }
         }.start()
     }
+
 
     private fun stopScan() {
         val re = radioEngine
@@ -1878,6 +1901,41 @@ private const val FULL_STOP_DELAY_MS = 120000L
         radioScan = false
         radioScanRunnable?.let { main.removeCallbacks(it) }
         updateRadioButtons()
+    }
+
+    /**
+     * 扫描中改门限。
+     *
+     * 引擎会顺手把已经扫到的结果按新门限过一遍 —— 调高门限就是想滤掉弱信号，
+     * 让它们留在表里没有意义。所以这里只传一个数，不用重扫。
+     */
+    private fun showScanMarginDialog() {
+        val pad = (resources.displayMetrics.density * 16).toInt()
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.setPadding(pad, pad / 2, pad, 0)
+        val e = numField(
+            col, "门限：高出底噪多少 dB 才算信号（调大滤掉弱信号）",
+            String.format(Locale.US, "%.0f", scanMargin)
+        )
+        AlertDialog.Builder(this)
+            .setTitle("扫描门限")
+            .setView(col)
+            .setPositiveButton("应用") { _, _ ->
+                val v = e.text.toString().trim().toFloatOrNull() ?: 7f
+                setScanMargin(v.toDouble())
+            }
+            .setNegativeButton(R.string.ch_cancel, null)
+            .show()
+    }
+
+    private fun setScanMargin(v: Double) {
+        val re = radioEngine ?: return
+        scanMargin = v
+        prefs.edit().putFloat("scan_margin", v.toFloat()).apply()
+        Thread {
+            try { re.callAttr("set_scan_margin", v) } catch (_: Throwable) { }
+        }.start()
     }
 
     private fun showScanDialog() {
@@ -1901,6 +1959,8 @@ private const val FULL_STOP_DELAY_MS = 120000L
             .setTitle("扫描结果（点一行 = 存到信道）")
             .setView(col)
             .setPositiveButton("停止扫描") { _, _ -> stopScan() }
+            // 扫描中/扫描完都能改门限：引擎会立刻把表里低于新门限的行去掉
+            .setNeutralButton("门限") { _, _ -> showScanMarginDialog() }
             .setNegativeButton("关闭", null)
             .create()
         scanDialog?.show()
@@ -1920,9 +1980,12 @@ private const val FULL_STOP_DELAY_MS = 120000L
             v.findViewById<TextView>(R.id.chName).text =
                 String.format(Locale.US, "%.4f MHz%s", f / 1e6, if (cur) "  （当前收听）" else "")
             val ovl = r.optBoolean("ovl", false)
+            val nobs = r.optInt("n", 1)
+            // 显示"复扫了几次"：次数越多，频率是多次平均出来的，越可信
             v.findViewById<TextView>(R.id.chInfo).text = String.format(
-                Locale.US, "%s   %.0f dB%s", radioMode,
+                Locale.US, "%s   %.0f dB%s%s", radioMode,
                 r.optDouble("db", 0.0),
+                if (nobs > 1) String.format(Locale.US, "   已复扫 %d 次", nobs) else "",
                 if (ovl) "   ⚠过载" else ""
             )
             v.findViewById<TextView>(R.id.chInfo)
@@ -1984,7 +2047,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
     private fun openKeypad() {
         if (!radioVfo) return
         freqEditing = true
-        freqBuf = String.format(Locale.US, "%.4f", radioFreqHz / 1e6)
+        freqBuf = fmtMhz(radioFreqHz)
         keypad.visibility = View.VISIBLE
         renderFreqBuf()
     }
@@ -1992,11 +2055,11 @@ private const val FULL_STOP_DELAY_MS = 120000L
     private fun closeKeypad() {
         freqEditing = false
         keypad.visibility = View.GONE
-        tvFreq.text = String.format(Locale.US, "%.4f", radioFreqHz / 1e6)
+        showFreq(fmtMhz(radioFreqHz))
     }
 
     private fun renderFreqBuf() {
-        tvFreq.text = if (freqBuf.isEmpty()) "—" else freqBuf
+        showFreq(if (freqBuf.isEmpty()) "—" else freqBuf)
     }
 
     /** 只收数字和一个小数点；整数最多 4 位（到 1700MHz），小数最多 4 位（1Hz） */
@@ -2029,7 +2092,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
         radioCall2("set_frequency", radioFreqHz)
         freqEditing = false
         keypad.visibility = View.GONE
-        tvFreq.text = String.format(Locale.US, "%.4f", mhz)
+        showFreq(fmtMhzText(mhz))
         updateChannelBar()
         saveVfoState()
     }
@@ -2084,10 +2147,40 @@ private const val FULL_STOP_DELAY_MS = 120000L
         radioCall2("set_ctcss", radioCtcss)
     }
 
+    /**
+     * 频率文本：最多 4 位小数，去掉没意义的尾零。
+     * 95.9000 → 95.9，438.5000 → 438.5，457.8250 → 457.825（到 1Hz 的精度一个不丢）。
+     */
+    private fun fmtMhzText(mhz: Double): String {
+        val s = String.format(Locale.US, "%.4f", mhz).trimEnd('0').trimEnd('.')
+        return s.ifEmpty { "0" }
+    }
+
+    private fun fmtMhz(hz: Double): String = fmtMhzText(hz / 1e6)
+
+    /**
+     * 频率数字要正对屏幕中心。
+     *
+     * 这一行是【数字 + MHz】整体居中，右边挂着的 MHz 会把数字往左顶半个标签宽。
+     * 给这行补一个等量的左内边距就把偏移抵消掉，数字回到正中、MHz 紧贴其右。
+     * 偏移量必须按 MHz 的实测宽度算 —— 写死 dp 在换字体/换语言后会差几像素。
+     */
+    private fun showFreq(text: String) {
+        tvFreq.text = text
+        tvFreq.post { centerFreqRow() }
+    }
+
+    private fun centerFreqRow() {
+        val u = tvMhzUnit.width
+        if (u <= 0) return
+        val pad = u + (resources.displayMetrics.density * 6).toInt()
+        if (freqRow.paddingStart != pad) freqRow.setPadding(pad, 0, 0, 0)
+    }
+
     /** 刷新频率显示。正在键盘输入时不要覆盖用户打的内容。 */
     private fun setFreqText(hz: Double) {
         if (freqEditing) return
-        tvFreq.text = String.format(Locale.US, "%.4f", hz / 1e6)
+        showFreq(fmtMhz(hz))
     }
 
     private fun openUrl(url: String) {
