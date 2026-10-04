@@ -8,12 +8,15 @@
 
 package com.railfan.lbj
 
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Typeface
+import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
 import android.location.Location
 import android.location.LocationListener
@@ -53,6 +56,7 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.chaquo.python.PyObject
 import com.chaquo.python.Python
+import com.railfan.lbj.mirisdr.MiriSdrDevice
 import com.sdrtouch.rtlsdr.BuiltinDriver
 import com.sdrtouch.tools.StrRes
 import org.json.JSONArray
@@ -618,6 +622,9 @@ private const val FULL_STOP_DELAY_MS = 120000L
     private var tone: ToneGenerator? = null
     private var lastTrainTs = 0.0
     private var lastRateWarn = ""
+    // RSP1 类设备（Mirics MSi2500/MSi001）：本机自带的 rtl_tcp 服务由它提供
+    private var miriDevice: MiriSdrDevice? = null
+    private var miriConn: UsbDeviceConnection? = null
     private var tts: TextToSpeech? = null
     private var ttsOk = false
     // 同一趟车不要反复念：LBJ 每隔几秒就重发一次，车次 -> 上次播报时刻
@@ -3027,6 +3034,105 @@ private const val FULL_STOP_DELAY_MS = 120000L
         return c
     }
 
+    // ------------------------------------------------- RSP1 / RSP2（Mirics 芯片）
+    /**
+     * RSP1 / RSP1A / RSP2（Mirics MSi2500+MSi001 芯片）的入口。
+     *
+     * 这三型用的是 Mirics 芯片，有开源驱动（libmirisdr），所以能直接插手机用 —— 但它
+     * 【不是】内部驱动那条路，而是「在本机起一个 rtl_tcp 服务器」：起好后 App 按
+     * 【台架模式 + 127.0.0.1】连它。
+     *
+     * 授权流程故意做成「点两次」：第一次弹系统授权框，允许后再点一次就开始自检。
+     * 这样不用注册广播接收器，少一个生命周期坑。
+     */
+    private fun rsp1Action() {
+        val usb = getSystemService(Context.USB_SERVICE) as UsbManager
+        val dev = usb.deviceList.values.firstOrNull { it.vendorId == 0x1df7 }
+        if (dev == null) {
+            AlertDialog.Builder(this)
+                .setTitle("没找到 RSP1 类设备")
+                .setMessage("USB 上没看到 Mirics/SDRplay 设备（厂商 ID 0x1df7）。\n\n" +
+                    "请确认：\n" +
+                    "① 棒子插到底（OTG 转接头最容易接触不良）\n" +
+                    "② 首次插入时在系统弹窗里点了【允许】\n" +
+                    "③ 型号是 RSP1 / RSP1A / RSP2（Mirics 芯片）——" +
+                    " RSPduo / RSPdx / RSP1B 是另一套芯片，本驱动不支持")
+                .setPositiveButton("知道了", null)
+                .show()
+            return
+        }
+        if (!usb.hasPermission(dev)) {
+            val flags = if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_IMMUTABLE else 0
+            usb.requestPermission(dev,
+                PendingIntent.getBroadcast(this, 0,
+                    Intent("com.railfan.lbj.USB_PERMISSION"), flags))
+            toast("请在系统弹窗里点【允许】，然后再点一次这个按钮")
+            return
+        }
+        val name = dev.deviceName
+        toast("正在自检 RSP1…（结果会弹出来）")
+        Thread {
+            val conn = try { usb.openDevice(dev) } catch (t: Throwable) { null }
+            if (conn == null) {
+                main.post { toast("打开 USB 设备失败（可能被别的 App 占用）") }
+                return@Thread
+            }
+            val res = try {
+                if (miriDevice == null) miriDevice = MiriSdrDevice()
+                miriDevice!!.probe(conn.fileDescriptor, name)
+            } catch (t: Throwable) {
+                "自检异常：" + (t.message ?: t.toString())
+            }
+            try { conn.close() } catch (_: Throwable) { }
+            main.post {
+                AlertDialog.Builder(this)
+                    .setTitle("RSP1 自检结果")
+                    .setMessage(res)
+                    .setPositiveButton("启动驱动") { _, _ -> rsp1Start(usb, dev) }
+                    .setNegativeButton("关闭", null)
+                    .show()
+            }
+        }.start()
+    }
+
+    /** 真正起流：在本机 127.0.0.1:1234 开 rtl_tcp 服务。 */
+    private fun rsp1Start(usb: UsbManager, dev: UsbDevice) {
+        Thread {
+            try {
+                val conn = usb.openDevice(dev) ?: throw IllegalStateException("openDevice 返回空")
+                if (miriDevice == null) miriDevice = MiriSdrDevice()
+                try { miriConn?.close() } catch (_: Throwable) { }
+                miriConn = conn
+                // 增益：prefs 里是 dB，libmirisdr 要的是 0.1dB 单位
+                val gainTenth = Math.round(prefs.getFloat("gain", 19.7f) * 10f)
+                val freqHz = Math.round(prefs.getFloat("freq", FREQ_MHZ.toFloat()) * 1e6)
+                val ok = miriDevice!!.openAsync(miriDevice!!.handle(), conn.fileDescriptor,
+                    gainTenth, 960000L, freqHz, 1234, prefs.getInt("ppm", 0), 0,
+                    "127.0.0.1", dev.deviceName)
+                main.post {
+                    if (ok) {
+                        // 起好了就替用户把这三项设好，免得他不知道还要勾台架模式
+                        prefs.edit().putBoolean("bench", true)
+                            .putString("host", "127.0.0.1")
+                            .putString("tuner", "OTHER").apply()
+                        AlertDialog.Builder(this)
+                            .setTitle("RSP1 驱动已启动")
+                            .setMessage("驱动已在本机 127.0.0.1:1234 提供数据。\n\n" +
+                                "已顺手帮你设好：台架模式 ✓、服务器地址 127.0.0.1、" +
+                                "增益档位【其它/网络源】。\n\n" +
+                                "现在点【开始接收】即可。要换回 RTL 电视棒：" +
+                                "把设置里的【台架模式】取消勾选。")
+                            .setPositiveButton("知道了", null)
+                            .show()
+                    } else {
+                        toast("启动失败：看日志 MiriSdrDriver（设备被占用或速率不支持）")
+                    }
+                }
+            } catch (t: Throwable) {
+                main.post { toast("启动异常：" + (t.message ?: "")) }
+            }
+        }.start()
+    }
     // -------------------------------------------------------------- 列车接收历史
     /**
      * 历史操作总入口。
@@ -3388,6 +3494,14 @@ private const val FULL_STOP_DELAY_MS = 120000L
         // 列车接收历史保留天数：0 = 永久保留（默认）
         val eHist = numField(box, "列车历史保留天数（0 = 永久保留；填 180 就只留半年）",
             prefs.getInt("histkeep", 0).toString())
+
+        // RSP1 / RSP1A / RSP2（Mirics 芯片）用的入口：自检 + 启动本机 rtl_tcp 服务。
+        // 它不是"内部驱动"那条路，而是"本机外部服务器"：起好之后按【台架模式 + 127.0.0.1】接收。
+        val btnRsp = Button(this)
+        btnRsp.isAllCaps = false
+        btnRsp.text = "RSP1 / RSP2（Mirics 芯片）自检 / 启动驱动"
+        btnRsp.setOnClickListener { rsp1Action() }
+        box.addView(btnRsp)
 
         val view = ScrollView(this)
         view.addView(box)

@@ -11,6 +11,10 @@
     ★ 属性一律写成【十进制】：系统解析 device_filter 走资源 int 解析，十进制最稳。
 -->
 <resources>
+    <!-- Mirics MSi2500/MSi001：SDRplay RSP1 / RSP1A / RSP2 及同芯片克隆板（0x1df7） -->
+    <usb-device vendor-id="7671" product-id="9472" />   <!-- 0x1df7:0x2500 Mirics MSi2500（RSP1） -->
+    <usb-device vendor-id="7671" product-id="12288" />  <!-- 0x1df7:0x3000 SDRplay RSP1A -->
+    <usb-device vendor-id="7671" product-id="12304" />  <!-- 0x1df7:0x3010 SDRplay RSP2 -->
     <usb-device vendor-id="3034" product-id="10290" />  <!-- Generic RTL2832U -->
     <usb-device vendor-id="3034" product-id="10296" />  <!-- Generic RTL2832U OEM -->
     <usb-device vendor-id="1043" product-id="26240" />  <!-- DigitalNow Quad DVB-T PCI-E card -->

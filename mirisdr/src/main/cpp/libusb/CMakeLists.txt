@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.3.1)
 
-PROJECT( "libusb" C )
+# ★ 目标名必须和 :rtlsdr 模块里那份区分开：两个模块都出 libusb.so 的话，
+#   :app:mergeReleaseNativeLibs 会因为重名直接失败（真机踩过）。
+PROJECT( "libusb_miri" C )
 
 FILE ( GLOB_RECURSE SOURCES_LIB "libusb/*.c" )
 

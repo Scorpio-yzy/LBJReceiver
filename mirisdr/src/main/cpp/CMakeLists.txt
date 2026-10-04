@@ -25,9 +25,26 @@ ADD_LIBRARY( mirisdr SHARED ${SOURCES_LIB} )
 #   把 src 放进 -I 会让兼容层里的 <libusb.h> 又命中它自己，真头文件就永远进不来。
 TARGET_INCLUDE_DIRECTORIES( mirisdr PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/libmirisdr/include" )
-TARGET_LINK_LIBRARIES( mirisdr ${LOG_LIB} libusb )
+TARGET_LINK_LIBRARIES( mirisdr ${LOG_LIB} libusb_miri )
 
 TARGET_LINK_OPTIONS( mirisdr PRIVATE
+    "-Wl,-z,max-page-size=16384"
+    "-Wl,-z,common-page-size=16384"
+)
+
+# ---------------------------------------------------------------------------
+# 设备层 + rtl_tcp 服务器：src/ 下是"设备无关的服务器"（sdrtcp 等，来自 Signalware 的
+# rtl_tcp_andro，GPL-2.0+）加上本项目的 mirisdrdevice.c（把命令映射到 libmirisdr、
+# 把 IQ 喂给服务器）。App 只跟这一层打交道。
+# ---------------------------------------------------------------------------
+FILE ( GLOB_RECURSE SOURCES_DEVICE "src/*.c" )
+
+ADD_LIBRARY( mirisdrdevice SHARED ${SOURCES_DEVICE} )
+TARGET_INCLUDE_DIRECTORIES( mirisdrdevice PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/libmirisdr/include" )
+TARGET_LINK_LIBRARIES( mirisdrdevice ${LOG_LIB} mirisdr libusb_miri )
+TARGET_LINK_OPTIONS( mirisdrdevice PRIVATE
     "-Wl,-z,max-page-size=16384"
     "-Wl,-z,common-page-size=16384"
 )
