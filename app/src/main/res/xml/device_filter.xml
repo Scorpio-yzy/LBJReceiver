@@ -15,6 +15,12 @@
     <usb-device vendor-id="7671" product-id="9472" />   <!-- 0x1df7:0x2500 Mirics MSi2500（RSP1） -->
     <usb-device vendor-id="7671" product-id="12288" />  <!-- 0x1df7:0x3000 SDRplay RSP1A -->
     <usb-device vendor-id="7671" product-id="12304" />  <!-- 0x1df7:0x3010 SDRplay RSP2 -->
+    <!-- 同一颗 Mirics 芯片的老式 DVB-T 一体板（libmirisdr 也支持）：识别表里都有，
+         驱动能开，所以插入时也该问一声"是否用本应用打开" -->
+    <usb-device vendor-id="8256" product-id="54016" />  <!-- 0x2040:0xd300 Hauppauge WinTV 133559 -->
+    <usb-device vendor-id="1994" product-id="34193" />  <!-- 0x07ca:0x8591 AverMedia A859 Pure DVB-T -->
+    <usb-device vendor-id="1211" product-id="1335" />   <!-- 0x04bb:0x0537 IO-DATA GV-TV100 -->
+    <usb-device vendor-id="1297" product-id="55" />     <!-- 0x0511:0x0037 Logitec LDT-1S310U/J -->
     <usb-device vendor-id="3034" product-id="10290" />  <!-- Generic RTL2832U -->
     <usb-device vendor-id="3034" product-id="10296" />  <!-- Generic RTL2832U OEM -->
     <usb-device vendor-id="1043" product-id="26240" />  <!-- DigitalNow Quad DVB-T PCI-E card -->

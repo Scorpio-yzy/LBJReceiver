@@ -31,9 +31,11 @@
 - 来源：[ericek111/libmirisdr-5](https://github.com/ericek111/libmirisdr-5)（上游为 OSMOCOM/f4exb 的 libmirisdr）
 - 许可：**GPL-2.0-or-later**（源码头："either version 2 of the License, or (at your option) any
   later version"）—— 与本项目的 GPL-3.0-or-later 兼容，可以随 APK 分发
-- 用途：驱动 **Mirics MSi2500 + MSi001** 芯片的设备（SDRplay **RSP1** 及同芯片克隆板，
-  设备表里还列了 1df7:3000/3010）。**当前状态：驱动库已能编译进工程，但还没接到界面上**
-  （见 README「RSP1」一节）
+- 用途：驱动 **Mirics MSi2500 + MSi001** 芯片的设备（SDRplay **RSP1 / RSP1A / RSP2**
+  及同芯片克隆板）。已接到界面上：设置里的【RSP1 / RSP2（Mirics 芯片）自检 / 启动驱动】
+  （详见 docs/使用说明.md「接 RSP1 / RSP1A / RSP2」一节）。
+  设备识别表同时收了 libmirisdr 支持的那几种老式 MSi2500 一体板；表外的 ID 也能用
+  App 里的【USB 设备列表】手动点名打开
 - 该模块里的 `libusb/` 沿用 `:rtlsdr` 模块自带的那份 Android 移植（LGPL-2.1）
 - `libmirisdr/src/libusb.h` + `libusb_compat.c` 是本项目新增的兼容层（把上游要的
   libusb 1.0.22 接口映射到移植版已有的 fd 接口上），同样是 GPL-3.0-or-later

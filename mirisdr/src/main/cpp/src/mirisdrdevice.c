@@ -159,7 +159,8 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_initialize(JNIEnv *env, jobject thiz)
  * 朋友的机器上跑一次，就能知道设备能不能用、960k 认不认。
  */
 JNIEXPORT jstring JNICALL
-Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jint fd, jstring devicePath_)
+Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jint fd,
+        jstring devicePath_, jint hwFlavour)
 {
     (void) thiz;
     char msg[1024];
@@ -181,8 +182,12 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jint
     }
 
     n = snprintf(msg, sizeof(msg), "已打开设备 ✓\n");
-    r = mirisdr_set_hw_flavour(dev, MIRISDR_HW_SDRPLAY);
-    n += snprintf(msg + n, sizeof(msg) - n, "硬件型号设为 SDRplay：%s（%d）\n", r == 0 ? "成功" : "失败", r);
+    /* 前端波段表：0 = 通用 MSi2500 板，1 = SDRplay 三兄弟。由 Java 侧按 USB PID 判定。 */
+    int hw = (hwFlavour == 1) ? MIRISDR_HW_SDRPLAY : MIRISDR_HW_DEFAULT;
+    r = mirisdr_set_hw_flavour(dev, (mirisdr_hw_flavour_t) hw);
+    n += snprintf(msg + n, sizeof(msg) - n, "前端波段表设为 %s：%s（%d）\n",
+                  hw == MIRISDR_HW_SDRPLAY ? "SDRplay" : "通用 MSi2500",
+                  r == 0 ? "成功" : "失败", r);
 
     r = mirisdr_set_sample_format(dev, "504_S8");
     n += snprintf(msg + n, sizeof(msg) - n, "8 位 IQ 采样格式：%s（%d）\n", r == 0 ? "成功" : "失败", r);
@@ -215,7 +220,8 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jint
 JNIEXPORT jboolean JNICALL
 Java_com_railfan_lbj_mirisdr_MiriSdrDevice_openAsync(
         JNIEnv *env, jobject thiz, jlong pointer, jint fd, jint gain, jlong samplingrate,
-        jlong frequency, jint port, jint ppm, jint biast, jstring address_, jstring devicePath_)
+        jlong frequency, jint port, jint ppm, jint biast, jstring address_, jstring devicePath_,
+        jint hwFlavour)
 {
     (void) thiz;
     (void) biast;            /* Mirics 芯片没有偏置供电（bias tee），忽略 */
@@ -229,6 +235,10 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_openAsync(
     jboolean ok = JNI_FALSE;
     jclass clazz = (*env)->GetObjectClass(env, thiz);
     jmethodID announceOnOpen = (*env)->GetMethodID(env, clazz, "announceOnOpen", "()V");
+    /* GetMethodID 失败会留下一个 pending 的 NoSuchMethodError；不清掉的话它会在 native
+     * 返回 Java 时抛出，把这次"其实已经开流成功"的调用变成异常。清掉即可，功能不受影响。 */
+    if ((*env)->ExceptionCheck(env))
+        (*env)->ExceptionClear(env);
 
     mirisdr_set_android_device_path(devicePath);
 
@@ -239,7 +249,8 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_openAsync(
     }
     MIRI_LOGI("设备已打开: %s", mirisdr_get_device_name(0) ? mirisdr_get_device_name(0) : "(未知)");
 
-    mirisdr_set_hw_flavour(dev, MIRISDR_HW_SDRPLAY);
+    mirisdr_set_hw_flavour(dev, (mirisdr_hw_flavour_t)
+            (hwFlavour == 1 ? MIRISDR_HW_SDRPLAY : MIRISDR_HW_DEFAULT));
     mirisdr_set_sample_format(dev, "504_S8");
 
     if (samplingrate > 0 && mirisdr_set_sample_rate(dev, (uint32_t) samplingrate) != 0)

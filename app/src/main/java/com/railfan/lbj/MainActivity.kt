@@ -10,7 +10,9 @@ package com.railfan.lbj
 
 import android.app.PendingIntent
 import android.content.Context
+import android.content.BroadcastReceiver
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.Manifest
 import android.content.pm.PackageManager
@@ -446,6 +448,9 @@ private const val FULL_STOP_DELAY_MS = 120000L
         // 再加 DSP 线程 join(1.5)，最长能把主线程卡住约 3.5 秒（足以触发 ANR）。
         // 所以只置标志 + 丢到后台线程。
         main.removeCallbacksAndMessages(null)
+        // USB 授权回调跟着 Activity 一起撤，别让它活过界面（否则会抱着旧 Activity 泄漏）
+        try { usbPermRx?.let { unregisterReceiver(it) } } catch (_: Throwable) { }
+        usbPermRx = null
         // 收音机也要收干净：先停轮询与音频，再把数据源还回去
         stopRadioPoll()
         radioScan = false
@@ -625,6 +630,9 @@ private const val FULL_STOP_DELAY_MS = 120000L
     // RSP1 类设备（Mirics MSi2500/MSi001）：本机自带的 rtl_tcp 服务由它提供
     private var miriDevice: MiriSdrDevice? = null
     private var miriConn: UsbDeviceConnection? = null
+    // 自检时用到：pendingRsp1Dev = 刚点过的那台（可能是识别表外的新型号，授权后接着用它）
+    private var pendingRsp1Dev: UsbDevice? = null
+    private var usbPermRx: BroadcastReceiver? = null
     private var tts: TextToSpeech? = null
     private var ttsOk = false
     // 同一趟车不要反复念：LBJ 每隔几秒就重发一次，车次 -> 上次播报时刻
@@ -3036,58 +3044,134 @@ private const val FULL_STOP_DELAY_MS = 120000L
 
     // ------------------------------------------------- RSP1 / RSP2（Mirics 芯片）
     /**
+     * 识别表：知道是 Mirics 芯片的 USB ID。前三条是 SDRplay 三兄弟（RSP1/RSP1A/RSP2），
+     * 后四条是 libmirisdr 那个年代的一体板（老式 DVB-T 棒，同芯片）。
+     *
+     * 这个表只用来"自动认出来"；表外的板子照样能用 —— 自检失败时会弹出【整条 USB 总线
+     * 上的设备列表】，点哪台就拿哪台按 Mirics 打开。所以用户反馈"没找到设备"时，先看他
+     * 那一屏截图里到底挂的是什么 ID，再决定要不要往表里加。
+     */
+    private val MIRI_KNOWN = arrayOf(
+        0x1df7 to 0x2500, 0x1df7 to 0x3000, 0x1df7 to 0x3010,
+        0x2040 to 0xd300, 0x07ca to 0x8591, 0x04bb to 0x0537, 0x0511 to 0x0037)
+
+    /**
+     * 前端波段切换表按型号分两套：SDRplay 三兄弟的滤波器/本振切换值跟通用 MSi2500 板
+     * 不一样（libmirisdr 里就是 hw_switch_freq_plan_default / _sdrplay 两张表）。
+     * 选错了能"打开、能设频率"，但天线段选错就收不到信号 —— 所以按 PID 选，别写死。
+     * 返回：0 = 通用 MSi2500，1 = SDRplay。
+     */
+    private fun miriHwFlavour(d: UsbDevice): Int =
+        if (d.vendorId == 0x1df7 &&
+            (d.productId == 0x2500 || d.productId == 0x3000 || d.productId == 0x3010)) 1 else 0
+
+    private fun isMiriKnown(d: UsbDevice): Boolean =
+        MIRI_KNOWN.any { it.first == d.vendorId && it.second == d.productId }
+
+    /** 一行设备描述：VID:PID + 能读到的厂商/产品名 + 系统设备路径（没授权时名字读不到）。 */
+    private fun usbLine(d: UsbDevice): String {
+        val nm = try {
+            listOfNotNull(d.manufacturerName, d.productName).joinToString(" ")
+        } catch (_: Throwable) { "" }
+        return String.format(Locale.US, "%04X:%04X", d.vendorId, d.productId) +
+            (if (nm.isBlank()) "" else "  " + nm) + "\n" + d.deviceName
+    }
+
+    /**
      * RSP1 / RSP1A / RSP2（Mirics MSi2500+MSi001 芯片）的入口。
      *
      * 这三型用的是 Mirics 芯片，有开源驱动（libmirisdr），所以能直接插手机用 —— 但它
      * 【不是】内部驱动那条路，而是「在本机起一个 rtl_tcp 服务器」：起好后 App 按
      * 【台架模式 + 127.0.0.1】连它。
      *
-     * 授权流程故意做成「点两次」：第一次弹系统授权框，允许后再点一次就开始自检。
-     * 这样不用注册广播接收器，少一个生命周期坑。
+     * 认设备分三档，从确定到不确定：
+     *   ① 刚在设备列表里手动点过的那台（用户已经明说要试它了）
+     *   ② 识别表里的型号
+     *   ③ 表里没有但厂商 ID 是 0x1df7 的（SDRplay 家新出的就用这档兜一下）
+     * 三档都没有 = 不猜了，把整条 USB 总线列出来让用户看清 + 手动选（朋友测试时全靠这个）。
      */
     private fun rsp1Action() {
         val usb = getSystemService(Context.USB_SERVICE) as UsbManager
-        val dev = usb.deviceList.values.firstOrNull { it.vendorId == 0x1df7 }
+        val all = usb.deviceList.values.toList()
+        val dev = all.firstOrNull { it.deviceName == pendingRsp1Dev?.deviceName }
+            ?: all.firstOrNull { isMiriKnown(it) }
+            ?: all.firstOrNull { it.vendorId == 0x1df7 }
         if (dev == null) {
-            AlertDialog.Builder(this)
-                .setTitle("没找到 RSP1 类设备")
-                .setMessage("USB 上没看到 Mirics/SDRplay 设备（厂商 ID 0x1df7）。\n\n" +
-                    "请确认：\n" +
-                    "① 棒子插到底（OTG 转接头最容易接触不良）\n" +
-                    "② 首次插入时在系统弹窗里点了【允许】\n" +
-                    "③ 型号是 RSP1 / RSP1A / RSP2（Mirics 芯片）——" +
-                    " RSPduo / RSPdx / RSP1B 是另一套芯片，本驱动不支持")
-                .setPositiveButton("知道了", null)
-                .show()
+            showUsbDeviceListDialog(all)
             return
         }
+        pendingRsp1Dev = dev
         if (!usb.hasPermission(dev)) {
+            ensureUsbPermReceiver()
             val flags = if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_IMMUTABLE else 0
+            // setPackage：把这个广播明确限定给自己，免得被 Android 14 的隐式广播限制挡掉
             usb.requestPermission(dev,
                 PendingIntent.getBroadcast(this, 0,
-                    Intent("com.railfan.lbj.USB_PERMISSION"), flags))
-            toast("请在系统弹窗里点【允许】，然后再点一次这个按钮")
+                    Intent("com.railfan.lbj.USB_PERMISSION").setPackage(packageName), flags))
+            toast("请在系统弹窗里点【允许】，允许之后会自动接着自检")
             return
         }
+        rsp1Probe(dev)
+    }
+
+    /**
+     * 系统授权框的回调。授权通过就自动接上自检 —— 让用户少点一次、也少一个"忘了再点一次"
+     * 的坑（朋友远程测试时这一步最容易被卡住）。
+     * 注册失败也不影响功能：老办法"再点一次按钮"照样能用，所以这里只记日志不打扰用户。
+     */
+    private fun ensureUsbPermReceiver() {
+        if (usbPermRx != null) return
+        val rx = object : BroadcastReceiver() {
+            override fun onReceive(c: Context?, i: Intent?) {
+                val usb = getSystemService(Context.USB_SERVICE) as UsbManager
+                val d = pendingRsp1Dev ?: return
+                if (usb.hasPermission(d)) main.post { rsp1Probe(d) }
+            }
+        }
+        try {
+            ContextCompat.registerReceiver(this, rx,
+                IntentFilter("com.railfan.lbj.USB_PERMISSION"), ContextCompat.RECEIVER_NOT_EXPORTED)
+            usbPermRx = rx
+        } catch (t: Throwable) {
+            android.util.Log.w("MiriSdrDriver", "注册 USB 授权回调失败（再点一次按钮即可）", t)
+        }
+    }
+
+    /** 自检：打开 -> 设 960k/频率 -> 读增益档 -> 关掉。不改任何设置、不串流，随便点。 */
+    private fun rsp1Probe(dev: UsbDevice) {
+        val usb = getSystemService(Context.USB_SERVICE) as UsbManager
         val name = dev.deviceName
-        toast("正在自检 RSP1…（结果会弹出来）")
+        val hw = miriHwFlavour(dev)
+        toast("正在自检…（结果会弹出来）")
         Thread {
             val conn = try { usb.openDevice(dev) } catch (t: Throwable) { null }
             if (conn == null) {
-                main.post { toast("打开 USB 设备失败（可能被别的 App 占用）") }
+                main.post {
+                    AlertDialog.Builder(this)
+                        .setTitle("打不开这个 USB 设备")
+                        .setMessage("系统拒绝了 openDevice：\n\n" + usbLine(dev) + "\n\n" +
+                            "多半是被别的 App / 系统驱动占着（另一个 SDR App 没退干净，" +
+                            "或者上一次的自检没关掉）。\n\n" +
+                            "① 把其它收音机 / SDR / 电视 App 全部清掉\n" +
+                            "② 拔了重插，再点一次自检")
+                        .setPositiveButton("知道了", null)
+                        .show()
+                }
                 return@Thread
             }
             val res = try {
                 if (miriDevice == null) miriDevice = MiriSdrDevice()
-                miriDevice!!.probe(conn.fileDescriptor, name)
+                miriDevice!!.probe(conn.fileDescriptor, name, hw)
             } catch (t: Throwable) {
                 "自检异常：" + (t.message ?: t.toString())
             }
             try { conn.close() } catch (_: Throwable) { }
             main.post {
                 AlertDialog.Builder(this)
-                    .setTitle("RSP1 自检结果")
-                    .setMessage(res)
+                    .setTitle("自检结果  " +
+                        String.format(Locale.US, "%04X:%04X", dev.vendorId, dev.productId))
+                    .setMessage(res + "\n\n前端波段表：" +
+                        (if (hw == 1) "SDRplay（RSP1/RSP1A/RSP2）" else "通用 MSi2500"))
                     .setPositiveButton("启动驱动") { _, _ -> rsp1Start(usb, dev) }
                     .setNegativeButton("关闭", null)
                     .show()
@@ -3095,8 +3179,51 @@ private const val FULL_STOP_DELAY_MS = 120000L
         }.start()
     }
 
-    /** 真正起流：在本机 127.0.0.1:1234 开 rtl_tcp 服务。 */
+    /**
+     * 没认出来时不猜：把当前挂着的 USB 设备全列出来。
+     * 这一屏是给"远程测试"用的 —— 用户截图发过来，就能知道棒子到底认成了什么 ID，
+     * 或者压根没被枚举（那就是供电 / OTG 线的问题）。
+     */
+    private fun showUsbDeviceListDialog(all: List<UsbDevice>) {
+        android.util.Log.i("MiriSdrDriver", "USB 设备 " + all.size + " 个：" +
+            all.joinToString(" | ") { usbLine(it).replace('\n', ' ') })
+        if (all.isEmpty()) {
+            AlertDialog.Builder(this)
+                .setTitle("没找到 RSP1 类设备")
+                .setMessage("手机现在【一个 USB 设备都没认到】—— 棒子没上电，或者系统没枚举它。\n\n" +
+                    "① OTG 转接头/线接触不良或只能充电：拔了重插，换一根线\n" +
+                    "② 供电不够（这种棒子比 RTL 电视棒费电）：换带供电的 OTG 扩展坞\n" +
+                    "③ 个别机型设置里有【USB OTG】开关，确认是开着的\n\n" +
+                    "插好之后系统一般会弹一下『已连接 USB 设备』；看到它了再点一次自检。\n" +
+                    "（RTL 电视棒能用、只有这个棒子不认，基本就是 ① 或 ②）")
+                .setPositiveButton("知道了", null)
+                .show()
+            return
+        }
+        val names = all.map { usbLine(it) }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("USB 上现在有 " + all.size + " 个设备")
+            .setMessage("没有已知的 SDRplay / Mirics 型号。\n\n" +
+                "下面是当前全部 USB 设备：有你的棒子就点它，会强行按 Mirics 芯片打开试一次；\n" +
+                "没有它、或者点了还是不行，请把这一屏【截图】发我。")
+            .setItems(names) { _, i -> rsp1ForceProbe(all[i]) }
+            .setNegativeButton("关闭", null)
+            .show()
+    }
+
+    /** 用户手动点名的那台：记下来，流程照走（要授权就先授权，授权完自动接自检）。 */
+    private fun rsp1ForceProbe(dev: UsbDevice) {
+        pendingRsp1Dev = dev
+        rsp1Action()
+    }
+
+    /**
+     * 真正起流：在本机 127.0.0.1:1234 开 rtl_tcp 服务。
+     * 失败时给的是"照着做就能好"的清单，而不是一句"看日志" —— 装机给别人测时用户手里
+     * 没有 logcat，弹窗必须自己把下一步说清。
+     */
     private fun rsp1Start(usb: UsbManager, dev: UsbDevice) {
+        val hw = miriHwFlavour(dev)
         Thread {
             try {
                 val conn = usb.openDevice(dev) ?: throw IllegalStateException("openDevice 返回空")
@@ -3108,7 +3235,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 val freqHz = Math.round(prefs.getFloat("freq", FREQ_MHZ.toFloat()) * 1e6)
                 val ok = miriDevice!!.openAsync(miriDevice!!.handle(), conn.fileDescriptor,
                     gainTenth, 960000L, freqHz, 1234, prefs.getInt("ppm", 0), 0,
-                    "127.0.0.1", dev.deviceName)
+                    "127.0.0.1", dev.deviceName, hw)
                 main.post {
                     if (ok) {
                         // 起好了就替用户把这三项设好，免得他不知道还要勾台架模式
@@ -3125,11 +3252,28 @@ private const val FULL_STOP_DELAY_MS = 120000L
                             .setPositiveButton("知道了", null)
                             .show()
                     } else {
-                        toast("启动失败：看日志 MiriSdrDriver（设备被占用或速率不支持）")
+                        AlertDialog.Builder(this)
+                            .setTitle("驱动没起来")
+                            .setMessage("在下面这台设备上开流失败：\n\n" + usbLine(dev) + "\n\n" +
+                                "① 设备被占用：把别的 SDR / 收音机 / 电视 App 全清掉，" +
+                                "拔了重插再试一次\n" +
+                                "② 采样率或频率回读是 0：这颗板子的时钟/固件跟通用 Mirics 不一样，" +
+                                "请把【自检结果】那一屏截图发我\n" +
+                                "③ 还不行就把手机重启一次（USB 子系统偶尔会卡在占用状态）")
+                            .setPositiveButton("知道了", null)
+                            .show()
                     }
                 }
             } catch (t: Throwable) {
-                main.post { toast("启动异常：" + (t.message ?: "")) }
+                main.post {
+                    AlertDialog.Builder(this)
+                        .setTitle("启动异常")
+                        .setMessage((t.message ?: t.toString()) + "\n\n" +
+                            "设备：" + usbLine(dev) + "\n\n" +
+                            "拔了重插再试；一直这样请把这一屏截图发我。")
+                        .setPositiveButton("知道了", null)
+                        .show()
+                }
             }
         }.start()
     }
@@ -3499,8 +3643,14 @@ private const val FULL_STOP_DELAY_MS = 120000L
         // 它不是"内部驱动"那条路，而是"本机外部服务器"：起好之后按【台架模式 + 127.0.0.1】接收。
         val btnRsp = Button(this)
         btnRsp.isAllCaps = false
-        btnRsp.text = "RSP1 / RSP2（Mirics 芯片）自检 / 启动驱动"
+        btnRsp.text = "RSP1 / RSP2（Mirics 芯片）自检 / 启动驱动（长按看 USB 设备列表）"
         btnRsp.setOnClickListener { rsp1Action() }
+        // 长按 = 不管认不认识，直接看整条 USB 总线上挂着什么（远程排查用）
+        btnRsp.setOnLongClickListener {
+            val usb = getSystemService(Context.USB_SERVICE) as UsbManager
+            showUsbDeviceListDialog(usb.deviceList.values.toList())
+            true
+        }
         box.addView(btnRsp)
 
         val view = ScrollView(this)
