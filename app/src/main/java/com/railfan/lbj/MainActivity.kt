@@ -3180,6 +3180,13 @@ private const val FULL_STOP_DELAY_MS = 120000L
     private fun showHistDetail(i: Int) {
         val t = histTrips.optJSONObject(i) ?: return
         val sb = StringBuilder()
+        // ★ 这里【不能】用 t.opt(key) 判空：org.json 在「键不存在 / 值为 null」时返回的是
+        //   JSONObject.NULL 这个哨兵对象，而不是 Java 的 null。拿它去 String.format 会抛
+        //   IllegalFormatConversionException 直接闪退 —— 真机实测：点没有经纬度的记录必崩。
+        //   所以统一走下面两个安全取值：字符串把 null 当空串，数字先 isNull 再取。
+        fun s(k: String): String = t.optString(k, "").let { if (it == "null") "" else it }
+        fun d(k: String): Double? =
+            if (t.isNull(k)) null else t.optDouble(k, Double.NaN).takeIf { !it.isNaN() }
         fun add(k: String, v: String) {
             if (v.isNotEmpty() && v != "null") sb.append(k).append("：").append(v).append('\n')
         }
@@ -3187,32 +3194,34 @@ private const val FULL_STOP_DELAY_MS = 120000L
             if (a.isEmpty() && b.isEmpty()) return
             add(k, if (b.isEmpty() || a == b) a else a + " → " + b)
         }
-        add("日期", t.optString("date"))
-        add("车次", t.optString("train"))
-        add("类别", t.optString("category"))
-        pair("方向", t.optString("direction"), t.optString("direction_last"))
-        pair("机车", t.optString("loco"), t.optString("loco_last"))
-        add("线路", t.optString("route"))
-        add("通联起止", t.optString("first_time") + " ~ " + t.optString("last_time"))
-        pair("公里标", t.optString("start_km"), t.optString("end_km"))
-        val mn = t.optString("min_km", ""); val mx = t.optString("max_km", "")
-        if (mn.isNotEmpty() && mx.isNotEmpty() && mn != mx) add("公里标范围", mn + " ~ " + mx)
-        pair("端位", t.optString("end_pos_first"), t.optString("end_pos_last"))
-        val lon1 = t.opt("lon_first"); val lat1 = t.opt("lat_first")
-        val lon2 = t.opt("lon_last"); val lat2 = t.opt("lat_last")
-        if (lon1 != null && lat1 != null) {
-            add("经纬度（首次）", String.format(Locale.US, "%.4f, %.4f", lon1, lat1))
-            if (lon2 != null && lat2 != null && (lon1 != lon2 || lat1 != lat2)) {
-                add("经纬度（最后）", String.format(Locale.US, "%.4f, %.4f", lon2, lat2))
-            }
-        } else {
+        fun pos(lon: Double?, lat: Double?): String =
+            if (lon == null || lat == null) "" else String.format(Locale.US, "%.4f, %.4f", lon, lat)
+        add("日期", s("date"))
+        add("车次", s("train"))
+        add("类别", s("category"))
+        pair("方向", s("direction"), s("direction_last"))
+        pair("机车", s("loco"), s("loco_last"))
+        add("线路", s("route"))
+        add("通联起止", s("first_time") + " ~ " + s("last_time"))
+        pair("公里标", s("start_km"), s("end_km"))
+        val mn = d("min_km"); val mx = d("max_km")
+        if (mn != null && mx != null && mn != mx) {
+            add("公里标范围", String.format(Locale.US, "%.1f ~ %.1f", mn, mx))
+        }
+        pair("端位", s("end_pos_first"), s("end_pos_last"))
+        val p1 = pos(d("lon_first"), d("lat_first"))
+        val p2 = pos(d("lon_last"), d("lat_last"))
+        if (p1.isEmpty()) {
             add("经纬度", "这几条报文里没有（只有扩展帧才带）")
+        } else {
+            add("经纬度（首次）", p1)
+            if (p2.isNotEmpty() && p2 != p1) add("经纬度（最后）", p2)
         }
         add("报文数", t.optInt("n_msg").toString())
-        val sp = t.optDouble("speed_max", -1.0)
-        if (sp >= 0.0) add("最大速度", String.format(Locale.US, "%.0f km/h", sp))
+        val sp = d("speed_max")
+        if (sp != null && sp >= 0.0) add("最大速度", String.format(Locale.US, "%.0f km/h", sp))
         AlertDialog.Builder(this)
-            .setTitle("车次 " + t.optString("train"))
+            .setTitle("车次 " + s("train"))
             .setMessage(sb.toString())
             .setPositiveButton("关闭", null)
             .show()

@@ -18,4 +18,4 @@ dependencyResolutionManagement {
     }
 }
 rootProject.name = "LBJReceiver"
-include ':app', ':rtlsdr', ':sdrdrivertools'
+include ':app', ':rtlsdr', ':sdrdrivertools', ':mirisdr'
