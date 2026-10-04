@@ -617,6 +617,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
     // ---------------------------------------------------------- 告警音 / 语音播报
     private var tone: ToneGenerator? = null
     private var lastTrainTs = 0.0
+    private var lastRateWarn = ""
     private var tts: TextToSpeech? = null
     private var ttsOk = false
     // 同一趟车不要反复念：LBJ 每隔几秒就重发一次，车次 -> 上次播报时刻
@@ -2889,7 +2890,10 @@ private const val FULL_STOP_DELAY_MS = 120000L
     private fun applyPrefs(eng: PyObject) {
         fun t(block: () -> Unit) { try { block() } catch (_: Throwable) { } }
         // ★ 调谐器型号要排在 set_gain 之前 —— 它决定用哪张增益档位表
-        t { eng.callAttr("set_tuner", if (prefs.getBoolean("fc0013", true)) "FC0013" else "R820T") }
+        t {
+            eng.callAttr("set_tuner", prefs.getString("tuner",
+                if (prefs.getBoolean("fc0013", true)) "FC0013" else "R820T"))
+        }
         t { eng.callAttr("set_host", effectiveHost()) }
         // ★ 频率必须在这里下发。
         // 之前只在设置对话框的"保存并应用"里调用 set_frequency，于是
@@ -3347,10 +3351,22 @@ private const val FULL_STOP_DELAY_MS = 120000L
             prefs.getFloat("thr", -55f).toString(), signed = true)
         val eHold = numField(box, "门控释放保持 ms（0 ~ 10000；包中间断开就加大）",
             prefs.getFloat("hold", 700f).toString())
-        // 调谐器型号决定用哪张增益档位表。选错了不会收不到，但界面显示的"实际增益"
-        // 会是错的，而且用不了某些档位（FC0013 的负增益档 R820T 表里根本没有）。
-        val cFc = check(box, "电视棒是 FC0013/FC0012（便宜的蓝色小棒常见；按它的真实档位调增益）",
-            prefs.getBoolean("fc0013", true))
+        // 增益档位表：决定了填进去的 dB 怎么"吸附"到设备真有的档位上。
+        //   FC0013/FC0012 与 R820T 的档位完全不同（FC0013 还有负档）；
+        //   RSP1/RSP2/Airspy 这类【非 RTL】设备走网络源，档位 App 不知道 ——
+        //   选"其它/网络源"就不吸附，填多少原样转给服务器。
+        val tunerNames = arrayOf("FC0013/FC0012", "R820T", "其它/网络源(RSP1 等)")
+        val tunerVals = arrayOf("FC0013", "R820T", "OTHER")
+        var tunerIdx = tunerVals.indexOf(prefs.getString("tuner",
+            if (prefs.getBoolean("fc0013", true)) "FC0013" else "R820T")).coerceAtLeast(0)
+        val btnTuner = Button(this)
+        btnTuner.isAllCaps = false
+        btnTuner.text = "增益档位：" + tunerNames[tunerIdx]
+        btnTuner.setOnClickListener {
+            tunerIdx = (tunerIdx + 1) % tunerNames.size
+            btnTuner.text = "增益档位：" + tunerNames[tunerIdx]
+        }
+        box.addView(btnTuner)
         val cAfc = check(box, "启用 AFC 自动频率跟踪", prefs.getBoolean("afc", true))
         val cBeep = check(box, "提示音：每解出一趟车次响一声（走媒体音量，可调为 0）", prefs.getBoolean("beep", true))
         val cAlarm = check(box, "接近告警音 + 振动：进入告警距离时急促提示", prefs.getBoolean("alarm", true))
@@ -3438,7 +3454,8 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 val builtinChanged = cBuiltin.isChecked != prefs.getBoolean("builtin", true)
                 prefs.edit().putBoolean("bench", cBench.isChecked)
                     .putBoolean("builtin", cBuiltin.isChecked)
-                    .putBoolean("fc0013", cFc.isChecked)
+                    .putString("tuner", tunerVals[tunerIdx])
+                    .putBoolean("fc0013", tunerVals[tunerIdx] == "FC0013")
                     .putString("host", host)
                     .putFloat("freq", freq!!).putFloat("gain", gain!!).putInt("ppm", ppm!!)
                     .putFloat("thr", thr!!).putFloat("hold", hold!!).putBoolean("afc", cAfc.isChecked)
@@ -3463,7 +3480,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                             builtinChanged
                         // ★ 调谐器型号必须【先于】增益下发：set_tuner 内部会按新表重新吸附一次增益，
                         //   顺序反了的话用户刚填的增益会被再吸附一次（虽然结果一样，但语义不清）。
-                        eng.callAttr("set_tuner", if (cFc.isChecked) "FC0013" else "R820T")
+                        eng.callAttr("set_tuner", tunerVals[tunerIdx])
                         eng.callAttr("set_frequency", freq.toDouble())
                         val actual = eng.callAttr("set_gain", gain.toDouble()).toDouble()
                         prefs.edit().putFloat("gain", actual.toFloat()).apply()
@@ -3626,6 +3643,12 @@ private const val FULL_STOP_DELAY_MS = 120000L
         val err = o.optString("error", "")
         val run = o.optBoolean("running", false)
         lastSnapshot = o
+        // 数据源实际采样率不对（RSP1 等非 RTL 设备常见）：明确提示一次
+        val rw = o.optString("rate_warn", "")
+        if (rw.isNotEmpty() && rw != lastRateWarn) {
+            lastRateWarn = rw
+            toast(rw)
+        }
         if (run != running) {
             running = run
             if (run) voiceSaid.clear()      // 新一场接收：允许重新播报同一趟车

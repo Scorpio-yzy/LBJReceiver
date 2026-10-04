@@ -5,6 +5,8 @@
 
 - 纯手机独立运行：电视棒插 OTG，不需要电脑、不需要外网、**不依赖 Google 服务**
 - 内置 rtl_tcp（自己起驱动），也可以走【台架模式】连外部服务器 —— 协议见 [docs/BENCH_MODE.md](docs/BENCH_MODE.md)
+- **任何 rtl_tcp 兼容数据源都能用**：RSP1/RSP2、Airspy 等"非 RTL"设备用 `rx_tcp`（SoapySDR）
+  变成 rtl_tcp 服务器接进来（增益档位选"其它/网络源"；连接后 App 会自检实际采样率是否 960 kS/s）
 - 解码链路（DDC → 信道滤波 → FM 鉴频 → AFC → DPLL 时钟恢复 → POCSAG → BCH 纠错 → LBJ 报文解析）
   沿用上游实现，本项目负责 Android 侧集成、界面与工程化
 - 收音机模式：NFM / AM / WFM、静噪、信道列表，以及**上下各 10 MHz 的快速扫描**

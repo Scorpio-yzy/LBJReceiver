@@ -244,6 +244,11 @@ FC0013_GAINS = [-9.9, -7.3, -6.5, -6.3, -6.0, -5.8, -5.4,
                 5.8, 6.1, 6.3, 6.5, 6.7, 6.8, 7.0, 7.1,
                 17.9, 18.1, 18.2, 18.4, 18.6, 18.8, 19.1, 19.7]
 
+# "非 RTL"设备（RSP1/RSP2、Airspy 等，走网络 rtl_tcp 源）的增益：App 不知道它有哪些
+# 档位，所以用 0.5dB 一格、-20~60dB 的直通表 —— 填多少就原样下发给服务器，
+# 由服务器侧（SoapySDR / SDRplay API）去解释。
+_PASSTHROUGH_GAINS = [round(-20.0 + 0.5 * i, 1) for i in range(0, 161)]
+
 
 _SELFTEST_LOCK = threading.RLock()
 _SELFTEST_ACTIVE = False
@@ -344,6 +349,8 @@ class LbjEngine:
         # 列车接收历史（按"趟"归档、一天一个文件）。_on_train 里喂给它，
         # 落盘/导出/导入都在 lbj_triplog 里，界面通过下面几个 history_* 接口拿。
         self.triplog = _Triplog.TripLog()
+        self.measured_rate = 0.0     # 实测采样率（连上后量一次，见 _loop）
+        self.rate_warn = ''          # 速率不符时的告警文本（界面提示用）
 
         # 默认参数
         self.freq_mhz = 821.2375
@@ -762,6 +769,26 @@ class LbjEngine:
                 print('LBJ-ERR dsp:\n' + traceback.format_exc(), flush=True)
                 break
             n += 1
+            # ---- 采样率自检（前 12 块）：rtl_tcp 没有速率回执，只能自己量 ----
+            # 量出来再和 960 kS/s 比：不是的话(比如 RSP1 的固定抽取档位)频率会整体偏，
+            # 必须明确告诉用户，而不是让他去猜为什么收不到车。
+            try:
+                if n == 1:
+                    self._rate_n = len(iq)
+                    self._rate_t0 = time.time()
+                elif n <= 12:
+                    self._rate_n = int(getattr(self, '_rate_n', 0)) + len(iq)
+                    if n == 12:
+                        el = time.time() - float(getattr(self, '_rate_t0', time.time()))
+                        rate, warn = self.check_rate(self._rate_n, el)
+                        self.measured_rate = rate
+                        self.rate_warn = warn
+                        print('LBJ: ' + (warn if warn else
+                                         '采样率自检通过 %.0f kS/s' % (rate / 1000.0)),
+                              flush=True)
+            except Exception as e:
+                # 自检只是旁路功能，绝不能因为它把 DSP 线程搞死
+                print('LBJ-ERR rate check: %s' % e, flush=True)
             if n == 1:
                 print('LBJ: 已处理第 1 个数据块，rssi=%s' % R._g2.get('rssi'), flush=True)
             elif n % 200 == 0:
@@ -1183,6 +1210,9 @@ class LbjEngine:
             'ppm': self.ppm,
             'bw_khz': self.bw_khz,
             'sample_rate_k': int(R.RTL_SAMPLE_RATE // 1000),
+            # 实测采样率与告警：非 RTL 数据源（RSP1 等）可能是别的速率，界面要提醒
+            'measured_rate_k': round(float(getattr(self, 'measured_rate', 0.0) or 0.0) / 1000.0, 1),
+            'rate_warn': getattr(self, 'rate_warn', ''),
             'cs_threshold': self.cs_threshold,
             'rssi_hold_ms': round(float(self._gate.hold_left_ms), 0) if self._gate else 0,
             'rssi': round(float(g2.get('rssi', -140.0)), 1),
@@ -1304,14 +1334,46 @@ class LbjEngine:
         self._reset_after_retune()
         return True
 
+    @staticmethod
+    def check_rate(samples, seconds):
+        """按"收了多少采样、花了多少秒"反推数据源的实际采样率（纯函数，便于测试）。
+
+        为什么必须查：App 的解调链（DDC、信道滤波、鉴频器）全按 960 kS/s 设计，
+        而 rtl_tcp 协议【没有】速率回执 —— 服务器给了别的速率，我们这边一点提示都没有。
+        RSP1/RSP2 这类非 RTL 设备的采样率是"固定几档 + 抽取"，很容易不是 960k；
+        那时频率、带宽、PPM 全是错的，却不会有任何报错。
+
+        返回 (实测速率, 告警文本)；对得上就返回 (rate, '')。
+        """
+        if not seconds or seconds <= 0 or not samples:
+            return 0.0, ''
+        rate = float(samples) / float(seconds)
+        ref = float(R.RTL_SAMPLE_RATE)
+        if abs(rate - ref) <= ref * 0.05:
+            return rate, ''
+        warn = ('数据源实际采样率 %.0f kS/s，不是 %.0f kS/s（差 %+.0f%%）。'
+                '解调链是按 %.0f kS/s 设计的，频率和带宽都会不对 —— '
+                '请把服务器设成 %d（rx_tcp 用 -s %d）。'
+                % (rate / 1000.0, ref / 1000.0, (rate - ref) / ref * 100.0,
+                   ref / 1000.0, int(ref), int(ref)))
+        return rate, warn
+
     def _gain_table(self):
-        """当前调谐器的有效增益档位表"""
+        """当前调谐器的有效增益档位表（'OTHER' = 非 RTL 的网络源，直通）。"""
+        if self.tuner == 'OTHER':
+            return _PASSTHROUGH_GAINS
         return FC0013_GAINS if self.tuner == 'FC0013' else R.R820T_GAINS
 
     def set_tuner(self, name):
-        """选择调谐器型号（'R820T' 或 'FC0013'），决定增益档位表"""
+        """选择调谐器型号：'R820T' / 'FC0013' / 'OTHER'（非 RTL 的网络源，增益直通）"""
         n = str(name or '').upper()
-        self.tuner = 'FC0013' if n.startswith('FC') else 'R820T'
+        if n.startswith('FC'):
+            self.tuner = 'FC0013'
+        elif (n.startswith('OTHER') or n.startswith('NET')
+              or n.startswith('RSP') or n.startswith('SOAPY')):
+            self.tuner = 'OTHER'
+        else:
+            self.tuner = 'R820T'
         # 换表之后重新吸附一次当前增益，免得停留在一个新型号里不存在的档位上
         self.set_gain(self.gain_db)
         return self.tuner
