@@ -30,13 +30,24 @@ public class MiriSdrDevice {
      * @param hwFlavour 0 = 通用 MSi2500 板，1 = SDRplay（RSP1/RSP1A/RSP2）。
      *                  两者的前端波段切换表不同，选错会"能打开但收不到信号"，
      *                  所以由 Java 侧按 USB PID 判定后传进来。
+     * @param tracePath 自检步骤落盘文件（App 私有目录里的普通文件）。native 里如果崩了，
+     *                  用户手里没有 logcat，只能靠这个文件带回"崩在哪一步"。
+     *                  正常跑完会写一行"自检结束"。
      */
-    public native String probe(int fd, String devicePath, int hwFlavour);
+    public native String probe(int fd, String devicePath, String tracePath, int hwFlavour);
 
-    /** 打开设备并在 port 上起 rtl_tcp 服务（地址一般传 127.0.0.1）。 */
+    /**
+     * 打开设备并在 port 上起 rtl_tcp 服务（地址一般传 127.0.0.1）。
+     *
+     * @param mode 取数方式："ISOC" 或 "BULK"，传自检试出来的那个（见 preferredMode()）。
+     *             Android 上这两种哪个能用没有定论 —— isoc 是上游默认，bulk 是 RTL 那条路用的。
+     */
     public native boolean openAsync(long handle, int fd, int gain, long samplerate, long frequency,
                                     int port, int ppm, int biasT, String address, String devicePath,
-                                    int hwFlavour);
+                                    int hwFlavour, String mode);
+
+    /** 自检里试出来的、真能收到数据的取数方式（"ISOC" / "BULK"）。 */
+    public native String preferredMode();
 
     /**
      * native 侧在开流成功后回调一次（与 :rtlsdr 模块的 SdrDevice 保持同名）。

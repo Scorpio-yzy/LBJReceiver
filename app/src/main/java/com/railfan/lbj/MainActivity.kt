@@ -439,6 +439,8 @@ private const val FULL_STOP_DELAY_MS = 120000L
         // 用户可能刚从驱动界面回来，或者刚插好电视棒 ——
         // 这时自动重新检查一次，标题栏上就能立刻看到状态变化。
         refreshDriverStatus()
+        // 上次自检如果在 native 里崩了（App 直接闪退），这里把崩溃点告诉用户
+        checkMiriProbeTrace()
     }
 
     override fun onDestroy() {
@@ -633,6 +635,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
     // 自检时用到：pendingRsp1Dev = 刚点过的那台（可能是识别表外的新型号，授权后接着用它）
     private var pendingRsp1Dev: UsbDevice? = null
     private var usbPermRx: BroadcastReceiver? = null
+    private var miriTraceChecked = false
     private var tts: TextToSpeech? = null
     private var ttsOk = false
     // 同一趟车不要反复念：LBJ 每隔几秒就重发一次，车次 -> 上次播报时刻
@@ -3159,9 +3162,12 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 }
                 return@Thread
             }
+            // 自检步骤落盘：native 里崩了的话用户看不到 logcat，只能靠这个文件
+            val trace = miriTraceFile()
+            try { trace.delete() } catch (_: Throwable) { }
             val res = try {
                 if (miriDevice == null) miriDevice = MiriSdrDevice()
-                miriDevice!!.probe(conn.fileDescriptor, name, hw)
+                miriDevice!!.probe(conn.fileDescriptor, name, trace.absolutePath, hw)
             } catch (t: Throwable) {
                 "自检异常：" + (t.message ?: t.toString())
             }
@@ -3217,6 +3223,32 @@ private const val FULL_STOP_DELAY_MS = 120000L
         rsp1Action()
     }
 
+    /** 自检步骤落盘文件（native 崩了之后全靠它）。 */
+    private fun miriTraceFile(): File = File(filesDir, "miri_probe.log")
+
+    /**
+     * 进界面时看一眼上次自检跑完了没有：没有最后那行"自检结束"就说明 native 崩了，
+     * 把落盘的最后几步显示出来。
+     * 装到别人手机上时用户没有 adb、没有 logcat —— 这是唯一能把崩溃点带回来的渠道。
+     */
+    private fun checkMiriProbeTrace() {
+        if (miriTraceChecked) return
+        miriTraceChecked = true
+        val f = miriTraceFile()
+        val txt = try { if (f.exists()) f.readText() else "" } catch (_: Throwable) { "" }
+        if (txt.isBlank()) return
+        if (txt.contains("自检结束")) {
+            try { f.delete() } catch (_: Throwable) { }
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("上次自检没跑完（App 崩在这里）")
+            .setMessage(txt.trim() + "\n\n把这一屏截图发我。")
+            .setPositiveButton("知道了") { _, _ -> try { f.delete() } catch (_: Throwable) { } }
+            .setNegativeButton("先留着", null)
+            .show()
+    }
+
     /**
      * 真正起流：在本机 127.0.0.1:1234 开 rtl_tcp 服务。
      * 失败时给的是"照着做就能好"的清单，而不是一句"看日志" —— 装机给别人测时用户手里
@@ -3233,9 +3265,11 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 // 增益：prefs 里是 dB，libmirisdr 要的是 0.1dB 单位
                 val gainTenth = Math.round(prefs.getFloat("gain", 19.7f) * 10f)
                 val freqHz = Math.round(prefs.getFloat("freq", FREQ_MHZ.toFloat()) * 1e6)
+                // 取数方式用自检试出来的那个（ISOC / BULK 哪个能出数据）
+                val mode = try { miriDevice!!.preferredMode() } catch (t: Throwable) { null } ?: "ISOC"
                 val ok = miriDevice!!.openAsync(miriDevice!!.handle(), conn.fileDescriptor,
                     gainTenth, 960000L, freqHz, 1234, prefs.getInt("ppm", 0), 0,
-                    "127.0.0.1", dev.deviceName, hw)
+                    "127.0.0.1", dev.deviceName, hw, mode)
                 main.post {
                     if (ok) {
                         // 起好了就替用户把这三项设好，免得他不知道还要勾台架模式

@@ -297,6 +297,19 @@ int mirisdr_reset (mirisdr_dev_t *p) {
     if (!p) goto failed;
     if (!p->dh) goto failed;
 
+#if defined(__ANDROID__)
+    /*
+     * ★ 本项目（LBJ Receiver）在 Android 上新增的改动：这里【不做】USB 端口复位。
+     *
+     * 桌面版复位是必要的（上游注释："否则设备有时会拒绝通信"）。但 Android 上设备是用
+     * Java 层交下来的 fd 打开的，USBDEVFS_RESET 会让设备重新枚举：这个 fd 立刻失效，
+     * 设备节点和权限也换成新的，于是后面所有寄存器读写都 ENODEV。现象就是
+     * "自检说打开成功，但设频率/读增益全失败，开流永远没数据"，而且看起来像驱动没写对。
+     * 跳过复位不影响后面的初始化 —— mirisdr_setup 紧接着还会发 streaming_stop/adc_stop。
+     */
+    fprintf(stderr, "mirisdr_reset: skipped on Android (a port reset would invalidate the Java USB fd)\n");
+    return 0;
+#else
     /* měli bychom uvolnit zařízení předem? */
 
     if ((r = libusb_reset_device(p->dh)) < 0) {
@@ -305,6 +318,7 @@ int mirisdr_reset (mirisdr_dev_t *p) {
     }
 
     return 0;
+#endif
 
 failed:
     return -1;
