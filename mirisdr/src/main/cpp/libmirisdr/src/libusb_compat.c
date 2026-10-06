@@ -60,5 +60,20 @@ int LIBUSB_CALL libusb_wrap_sys_device(libusb_context *ctx, intptr_t sys_dev,
     if (!dev)
         return LIBUSB_ERROR_NO_DEVICE;
 
-    return libusb_open2(dev, dev_handle, (int)sys_dev);
+    /*
+     * ★ 本项目在 Android 上新增的改动：把 Java 交下来的 fd【复制一份】再给 libusb。
+     *
+     * libusb_close() 内部会 close(hpriv->fd)（linux_usbfs.c: op_close），而 Java 侧那个
+     * UsbDeviceConnection 之后还会把自己的 fd 关一次 —— 直接用同一个 fd 就是双重关闭。
+     * 两次 close 之间只要别的线程拿到同一个 fd 号，我们就会把【别人的】fd 关掉，
+     * 现象是偶发的"这次驱动没起来、再点一次就好了"，极难查。
+     *
+     * dup 出来的 fd 指向同一个 open file description，UsbDeviceConnection 那边照旧有效，
+     * 所有 USBDEVFS ioctl（claim / alt setting / 提交 URB）全都照常工作。
+     */
+    int myfd = dup((int) sys_dev);
+    if (myfd < 0)
+        return LIBUSB_ERROR_NO_DEVICE;
+
+    return libusb_open2(dev, dev_handle, myfd);
 }

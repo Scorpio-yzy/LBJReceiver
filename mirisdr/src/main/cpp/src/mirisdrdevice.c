@@ -56,7 +56,20 @@ typedef struct {
     uint32_t out_cap;
     unsigned char carry[4];  /* 上一块的最后 4 个字节：跨块那一个样点的窗口要用 */
     int carry_n;
+    /* libmirisdr 的 S8 是【有符号】的，rtl_tcp/App 的约定是【无符号、直流 127.5】。
+     * 不转换的话 App 会把负数样本当成 128..255，正负样本各偏一个方向 —— 波形整个撕开。
+     * 到底要不要 +128，用开头几 KB 的直流均值自动判（有符号 ≈ 0，无符号 ≈ 128）。 */
+    int add128;
+    int dc_known;
+    long dc_sum;
+    int dc_count;
 } miri_device_t;
+
+/* 把一个原始字节搬到 rtl_tcp 的无符号约定（直流 127.5）上 */
+static inline int miri_conv(unsigned char b, int add128)
+{
+    return add128 ? ((int) (int8_t) b + 128) : (int) b;
+}
 
 /* 自检用：只收数据不干别的，用来判断 ISOC / BULK 哪个能出数 */
 typedef struct {
@@ -65,6 +78,11 @@ typedef struct {
     volatile int done;
     int ms;
     struct timeval t0;
+    /* 直流估计：有符号数据 ≈ 0，无符号数据 ≈ 128。自检把它报出来，
+     * 万一自动判别判错，看一眼截图就知道该按哪种处理。 */
+    long dc_sum;
+    int dc_n;
+    volatile int dc_mean;
 } miri_stream_probe_t;
 
 /*
@@ -167,40 +185,78 @@ static void miri_read_cb(unsigned char *buf, uint32_t len, void *ctx)
     if (d == NULL || d->dev == NULL || buf == NULL || len == 0)
         return;
 
-    /* 只有 2 倍这一种。别的值原样转发：宁可速率不对让 App 报出来，也别静默丢一半。 */
-    if (d->decim != 2 || len < 8) {
-        sdrtcp_feed(&d->tcp, buf, len);
-        return;
+    /* 开头几 KB 先量直流，判"有符号 / 无符号"（有符号数据均值 ≈ 0，无符号 ≈ 128）。
+     * 量够之前按最可能的情况（有符号）先跑，判错了也只是开头几毫秒的事。 */
+    if (!d->dc_known) {
+        for (uint32_t i = 0; i < len; i++)
+            d->dc_sum += buf[i];
+        d->dc_count += (int) len;
+        if (d->dc_count >= 8192) {
+            int mean = (int) (d->dc_sum / d->dc_count);
+            d->add128 = (mean >= 64) ? 0 : 1;
+            d->dc_known = 1;
+            MIRI_LOGI("实测直流均值 %d -> 按%s数据搬到 rtl_tcp 无符号约定", mean,
+                      d->add128 ? "有符号（+128）" : "本来就是无符号");
+        }
     }
 
-    uint32_t need = len / 2 + 4;
+    /*
+     * ★ sdrtcp_feed() 的长度单位是【16 位元素个数】，不是字节！
+     * 它的实现是 memcpy(..., sizeof(uint16_t) * len) 再按同样字节数发出去，
+     * 上游 RTL 那条路写的是 sdrtcp_feed(..., len / 2)。传字节数会干两件坏事：
+     *   ① 从样本缓冲里多读一倍（越界读）；
+     *   ② 发给 App 的字节数翻倍，其中一半是内存垃圾 ——
+     *      现象是"频谱在动、声音只有咔咔声，速率检测却刚好不报警"（因为字节速率恰好对）。
+     */
+    uint32_t need = len + 4;
     if (d->out_cap < need) {
         unsigned char *p = (unsigned char *) realloc(d->out, need);
         if (p == NULL) {
             MIRI_LOGE("抽取缓冲分配失败（%u 字节），本块原样转发", (unsigned) need);
-            sdrtcp_feed(&d->tcp, buf, len);
+            sdrtcp_feed(&d->tcp, buf, len / 2);
             return;
         }
         d->out = p;
         d->out_cap = need;
     }
 
+    int add = d->add128;
+
+    /* 不做抽取（只有非 960k 的客户端才会走到）时也要搬成无符号 */
+    if (d->decim != 2 || len < 8) {
+        for (uint32_t i = 0; i < len; i++)
+            d->out[i] = (unsigned char) miri_conv(buf[i], add);
+        sdrtcp_feed(&d->tcp, d->out, len / 2);
+        return;
+    }
+
     uint32_t m = 0;
-    /* 跨块的那一个样点：上一块最后 4 个字节 + 本块头 4 个字节 */
+    /* 跨块的那一个样点：上一块最后 4 个字节 + 本块头 4 个字节。
+     * 平均在"无符号约定"那一侧做：有符号数据先 +128 再平均，
+     * 因为 +128 是线性的，等价于"先平均再进行有符号→无符号"。 */
     if (d->carry_n == 4) {
-        d->out[m++] = (unsigned char) ((d->carry[0] + d->carry[2] + buf[0] + buf[2] + 2) >> 2);
-        d->out[m++] = (unsigned char) ((d->carry[1] + d->carry[3] + buf[1] + buf[3] + 2) >> 2);
+        int si = miri_conv(d->carry[0], add) + miri_conv(d->carry[2], add)
+                 + miri_conv(buf[0], add) + miri_conv(buf[2], add);
+        int sq = miri_conv(d->carry[1], add) + miri_conv(d->carry[3], add)
+                 + miri_conv(buf[1], add) + miri_conv(buf[3], add);
+        d->out[m++] = (unsigned char) ((si + 2) >> 2);
+        d->out[m++] = (unsigned char) ((sq + 2) >> 2);
     }
     for (uint32_t j = 0; (int) (j + 7) < (int) len; j += 4) {
-        d->out[m++] = (unsigned char) ((buf[j] + buf[j + 2] + buf[j + 4] + buf[j + 6] + 2) >> 2);
-        d->out[m++] = (unsigned char) ((buf[j + 1] + buf[j + 3] + buf[j + 5] + buf[j + 7] + 2) >> 2);
+        int si = miri_conv(buf[j], add) + miri_conv(buf[j + 2], add)
+                 + miri_conv(buf[j + 4], add) + miri_conv(buf[j + 6], add);
+        int sq = miri_conv(buf[j + 1], add) + miri_conv(buf[j + 3], add)
+                 + miri_conv(buf[j + 5], add) + miri_conv(buf[j + 7], add);
+        d->out[m++] = (unsigned char) ((si + 2) >> 2);
+        d->out[m++] = (unsigned char) ((sq + 2) >> 2);
     }
 
     memcpy(d->carry, buf + len - 4, 4);
     d->carry_n = 4;
 
-    if (m)
-        sdrtcp_feed(&d->tcp, d->out, m);
+    /* m 恒为偶数（上面两处都是成对写的），所以 m/2 正好把 m 个字节发出去 */
+    if (m >= 2)
+        sdrtcp_feed(&d->tcp, d->out, m / 2);
 }
 
 /* 自检用：到点还没自己停就强行取消（设备一个字节都不给的时候只能靠它） */
@@ -226,6 +282,12 @@ static void miri_stream_probe_cb(unsigned char *buf, uint32_t len, void *ctx)
     if (s->bytes == 0)
         gettimeofday(&s->t0, NULL);
     s->bytes += len;
+    if (s->dc_n < 32768) {
+        for (uint32_t i = 0; i < len && s->dc_n < 32768; i++, s->dc_n++)
+            s->dc_sum += buf[i];
+        if (s->dc_n >= 16384)
+            s->dc_mean = (int) (s->dc_sum / s->dc_n);
+    }
     struct timeval now;
     gettimeofday(&now, NULL);
     double el = (double) (now.tv_sec - s->t0.tv_sec) + (double) (now.tv_usec - s->t0.tv_usec) / 1e6;
@@ -238,6 +300,14 @@ static void miri_stream_probe_cb(unsigned char *buf, uint32_t len, void *ctx)
  * Android 上 ISOC / BULK 哪个能用没有定论，所以自检两种都试，答案跟着结果一起回去。
  * 返回 -1 表示起流都没起来（状态没复位或被占用），0 表示起了但没数据。
  */
+/* 最近一次 miri_stream_test 量到的直流均值（给自检报告用） */
+static volatile int g_last_dc_mean = -1;
+
+static int miri_stream_last_dc(void)
+{
+    return g_last_dc_mean;
+}
+
 static double miri_stream_test(mirisdr_dev_t *dev, const char *mode, int ms, long *bytes_out,
                                int *start_ret)
 {
@@ -261,6 +331,7 @@ static double miri_stream_test(mirisdr_dev_t *dev, const char *mode, int ms, lon
 
     *bytes_out = s.bytes;
     *start_ret = r;
+    g_last_dc_mean = (s.dc_n > 0) ? (int) (s.dc_sum / s.dc_n) : -1;
     if (r != 0)
         return -1;
     if (s.bytes == 0)
@@ -319,11 +390,16 @@ static void miri_command_cb(sdrtcp_t *tcp, void *ctx, sdr_tcp_command_t *cmd)
         case TCP_SET_GAIN_MODE:
             mirisdr_set_tuner_gain_mode(d->dev, (int) cmd->parameter);
             break;
-        case TCP_SET_GAIN:
-            MIRI_LOGI("set gain %d (tenths dB)", (int) cmd->parameter);
-            if (mirisdr_set_tuner_gain(d->dev, (int) cmd->parameter) != 0)
-                MIRI_LOGE("set_tuner_gain(%d) 失败", (int) cmd->parameter);
+        case TCP_SET_GAIN: {
+            /* ★ rtl_tcp 协议里的增益是【0.1 dB】，而 libmirisdr 要的是【整数 dB 0..102】。
+             * 直接下发（比如 App 的 18.0 dB -> 180）会被 libmirisdr 当成 180 dB 夹到 102，
+             * 也就是永远最大增益 —— 强信号直接过载，频谱在动、声音只有咔咔声。 */
+            int db = (int) (((int32_t) cmd->parameter + 5) / 10);
+            MIRI_LOGI("set gain %d (0.1dB) -> %d dB", (int) cmd->parameter, db);
+            if (mirisdr_set_tuner_gain(d->dev, db) != 0)
+                MIRI_LOGE("set_tuner_gain(%d dB) 失败", db);
             break;
+        }
         case TCP_ANDROID_GAIN_BY_PERCENTAGE: {
             /* 按百分比映射到 LNA 增益档（0~100 -> min..max） */
             int gains[MIRI_GAINS_MAX];
@@ -463,9 +539,10 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jint
     long b_iso = 0;
     int sr_iso = 0;
     double rate_iso = miri_stream_test(dev, "ISOC", 700, &b_iso, &sr_iso);
-    miri_trace(tracePath, "10 ISOC：起流返回 %d，收到 %ld 字节，实测 %.0f S/s", sr_iso, b_iso,
-               rate_iso);
-    MIRI_LOGI("ISOC: start=%d bytes=%ld rate=%.0f", sr_iso, b_iso, rate_iso);
+    int dc_iso = miri_stream_last_dc();
+    miri_trace(tracePath, "10 ISOC：起流返回 %d，收到 %ld 字节，实测 %.0f S/s，直流均值 %d",
+               sr_iso, b_iso, rate_iso, dc_iso);
+    MIRI_LOGI("ISOC: start=%d bytes=%ld rate=%.0f dc=%d", sr_iso, b_iso, rate_iso, dc_iso);
 
     miri_trace(tracePath, "11 试收数据（BULK）…");
     long b_bulk = 0;
@@ -484,11 +561,20 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jint
         mode_pick = "ISOC";      /* 两个都没数：按默认值起，失败原因看下面的说明 */
     snprintf(g_preferred_mode, sizeof(g_preferred_mode), "%s", mode_pick);
 
-    n += snprintf(msg + n, sizeof(msg) - n, "\n真收一段数据（各 0.7 秒）：\n");
-    n += snprintf(msg + n, sizeof(msg) - n, "  ISOC：%s\n",
-                  rate_iso > 0 ? "收到数据" : (sr_iso == 0 ? "起流了但没数据" : "起流失败"));
-    n += snprintf(msg + n, sizeof(msg) - n, "  BULK：%s\n",
-                  rate_bulk > 0 ? "收到数据" : (sr_bulk == 0 ? "起流了但没数据" : "起流失败"));
+    n += snprintf(msg + n, sizeof(msg) - n, "\n真收一段数据（各 0.7 秒，1.92M 是正常的）：\n");
+    if (rate_iso > 0)
+        n += snprintf(msg + n, sizeof(msg) - n, "  ISOC：收到数据，实测 %.2f MS/s，直流均值 %d（%s）\n",
+                      rate_iso / 1e6, dc_iso,
+                      dc_iso >= 64 ? "无符号" : "有符号，驱动会自动 +128");
+    else
+        n += snprintf(msg + n, sizeof(msg) - n, "  ISOC：%s\n",
+                      sr_iso == 0 ? "起流了但没数据" : "起流失败");
+    if (rate_bulk > 0)
+        n += snprintf(msg + n, sizeof(msg) - n, "  BULK：收到数据，实测 %.2f MS/s\n",
+                      rate_bulk / 1e6);
+    else
+        n += snprintf(msg + n, sizeof(msg) - n, "  BULK：%s\n",
+                      sr_bulk == 0 ? "起流了但没数据" : "起流失败");
     n += snprintf(msg + n, sizeof(msg) - n, "  采用的取数方式：%s\n", mode_pick);
 
     miri_trace(tracePath, "13 关闭设备…");
@@ -570,14 +656,16 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_openAsync(
         mirisdr_set_xtal_freq(dev, (uint32_t) (xtal + 0.5));
     }
 
+    /* gain 是从 rtl_tcp 语义来的【0.1 dB】，libmirisdr 要整数 dB（0..102） */
     if (gain == 0) {
         mirisdr_set_tuner_gain_mode(dev, 0);      /* 自动 */
     } else {
+        int gain_db = (gain + 5) / 10;
         mirisdr_set_tuner_gain_mode(dev, 1);
-        if (mirisdr_set_tuner_gain(dev, gain) != 0)
-            MIRI_LOGE("设增益 %d 失败", gain);
+        if (mirisdr_set_tuner_gain(dev, gain_db) != 0)
+            MIRI_LOGE("设增益 %d dB 失败", gain_db);
         else
-            MIRI_LOGI("增益设为 %.1f dB", gain / 10.0);
+            MIRI_LOGI("增益设为 %d dB（收到 %d，单位 0.1dB）", gain_db, gain);
     }
 
     if (mirisdr_reset_buffer(dev) != 0)
@@ -595,6 +683,11 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_openAsync(
     d->decim = (decim == 2) ? 2 : 1;
     d->client_rate = client_rate;
     d->carry_n = 0;
+    /* 方向默认按"有符号"（libmirisdr 的 S8 就是有符号），第一块数据会自己纠正 */
+    d->add128 = 1;
+    d->dc_known = 0;
+    d->dc_sum = 0;
+    d->dc_count = 0;
     pthread_mutex_unlock(&d->lock);
 
     sdrtcp_serve_client_async(&d->tcp, (void *) d, miri_command_cb, miri_closed_cb);
@@ -616,6 +709,9 @@ err:
         mirisdr_close(dev);
         dev = NULL;
     }
+    /* 失败也要把监听 socket 收掉：sdrtcp 的 listen socket 只有 stop/free 会关，
+     * 不收的话端口一直占着，用户再点一次【启动驱动】必然绑不上（"驱动没起来"）。 */
+    sdrtcp_stop_serving_client(&d->tcp);
     pthread_mutex_lock(&d->lock);
     d->dev = NULL;
     pthread_mutex_unlock(&d->lock);

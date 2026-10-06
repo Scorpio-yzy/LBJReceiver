@@ -3257,21 +3257,31 @@ private const val FULL_STOP_DELAY_MS = 120000L
     private fun rsp1Start(usb: UsbManager, dev: UsbDevice) {
         val hw = miriHwFlavour(dev)
         Thread {
-            try {
-                val conn = usb.openDevice(dev) ?: throw IllegalStateException("openDevice 返回空")
-                if (miriDevice == null) miriDevice = MiriSdrDevice()
-                try { miriConn?.close() } catch (_: Throwable) { }
-                miriConn = conn
-                // 增益：prefs 里是 dB，libmirisdr 要的是 0.1dB 单位
-                val gainTenth = Math.round(prefs.getFloat("gain", 19.7f) * 10f)
-                val freqHz = Math.round(prefs.getFloat("freq", FREQ_MHZ.toFloat()) * 1e6)
-                // 取数方式用自检试出来的那个（ISOC / BULK 哪个能出数据）
-                val mode = try { miriDevice!!.preferredMode() } catch (t: Throwable) { null } ?: "ISOC"
-                val ok = miriDevice!!.openAsync(miriDevice!!.handle(), conn.fileDescriptor,
-                    gainTenth, 960000L, freqHz, 1234, prefs.getInt("ppm", 0), 0,
-                    "127.0.0.1", dev.deviceName, hw, mode)
-                main.post {
-                    if (ok) {
+            var lastErr = ""
+            // 失败就等一秒再试一次：USB 子系统刚被自检用过，偶尔要缓一下才肯重新开流。
+            for (attempt in 1..2) {
+                var conn: UsbDeviceConnection? = null
+                var ok = false
+                try {
+                    conn = usb.openDevice(dev) ?: throw IllegalStateException("openDevice 返回空")
+                    if (miriDevice == null) miriDevice = MiriSdrDevice()
+                    try { miriConn?.close() } catch (_: Throwable) { }
+                    miriConn = conn
+                    // 增益：prefs 里是 dB，rtl_tcp 协议走 0.1dB 单位
+                    val gainTenth = Math.round(prefs.getFloat("gain", 19.7f) * 10f)
+                    val freqHz = Math.round(prefs.getFloat("freq", FREQ_MHZ.toFloat()) * 1e6)
+                    // 取数方式用自检试出来的那个（ISOC / BULK 哪个能出数据）
+                    val mode = try { miriDevice!!.preferredMode() } catch (t: Throwable) { null } ?: "ISOC"
+                    ok = miriDevice!!.openAsync(miriDevice!!.handle(), conn.fileDescriptor,
+                        gainTenth, 960000L, freqHz, 1234, prefs.getInt("ppm", 0), 0,
+                        "127.0.0.1", dev.deviceName, hw, mode)
+                    if (!ok) lastErr = "驱动内部起流失败（取数方式 $mode）"
+                } catch (t: Throwable) {
+                    lastErr = t.message ?: t.toString()
+                    ok = false
+                }
+                if (ok) {
+                    main.post {
                         // 起好了就替用户把这三项设好，免得他不知道还要勾台架模式
                         prefs.edit().putBoolean("bench", true)
                             .putString("host", "127.0.0.1")
@@ -3285,29 +3295,28 @@ private const val FULL_STOP_DELAY_MS = 120000L
                                 "把设置里的【台架模式】取消勾选。")
                             .setPositiveButton("知道了", null)
                             .show()
-                    } else {
-                        AlertDialog.Builder(this)
-                            .setTitle("驱动没起来")
-                            .setMessage("在下面这台设备上开流失败：\n\n" + usbLine(dev) + "\n\n" +
-                                "① 设备被占用：把别的 SDR / 收音机 / 电视 App 全清掉，" +
-                                "拔了重插再试一次\n" +
-                                "② 采样率或频率回读是 0：这颗板子的时钟/固件跟通用 Mirics 不一样，" +
-                                "请把【自检结果】那一屏截图发我\n" +
-                                "③ 还不行就把手机重启一次（USB 子系统偶尔会卡在占用状态）")
-                            .setPositiveButton("知道了", null)
-                            .show()
                     }
+                    return@Thread
                 }
-            } catch (t: Throwable) {
-                main.post {
-                    AlertDialog.Builder(this)
-                        .setTitle("启动异常")
-                        .setMessage((t.message ?: t.toString()) + "\n\n" +
-                            "设备：" + usbLine(dev) + "\n\n" +
-                            "拔了重插再试；一直这样请把这一屏截图发我。")
-                        .setPositiveButton("知道了", null)
-                        .show()
+                // 这次没成：把连接还回去（native 那边已经把 USB 和监听端口都收了），歇一下再试
+                try { conn?.close() } catch (_: Throwable) { }
+                miriConn = null
+                if (attempt == 1) {
+                    android.util.Log.w("MiriSdrDriver", "第一次启动失败（" + lastErr + "），1 秒后重试")
+                    try { Thread.sleep(1000) } catch (_: InterruptedException) { }
                 }
+            }
+            val why = lastErr
+            main.post {
+                AlertDialog.Builder(this)
+                    .setTitle("驱动没起来")
+                    .setMessage("试了两次都没起来。\n\n设备：" + usbLine(dev) + "\n原因：" + why + "\n\n" +
+                        "① 设备被占用：把别的 SDR / 收音机 / 电视 App 全清掉，拔了重插再试一次\n" +
+                        "② 采样率或频率回读是 0：这颗板子的时钟/固件跟通用 Mirics 不一样，" +
+                        "请把【自检结果】那一屏截图发我\n" +
+                        "③ 还不行就把手机重启一次（USB 子系统偶尔会卡在占用状态）")
+                    .setPositiveButton("知道了", null)
+                    .show()
             }
         }.start()
     }
