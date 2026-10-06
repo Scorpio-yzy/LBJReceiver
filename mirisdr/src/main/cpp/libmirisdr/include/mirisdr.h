@@ -62,6 +62,7 @@ MIRISDR_API int mirisdr_open_fd (mirisdr_dev_t **p, int fd);
 MIRISDR_API int mirisdr_close (mirisdr_dev_t *p);
 MIRISDR_API int mirisdr_reset (mirisdr_dev_t *p);                       /* extra */
 MIRISDR_API int mirisdr_reset_buffer (mirisdr_dev_t *p);
+MIRISDR_API int mirisdr_get_sync_loss (mirisdr_dev_t *p);   /* 本项目新增：504 帧解析丢帧计数 */
 MIRISDR_API int mirisdr_get_usb_strings (mirisdr_dev_t *dev, char *manufact, char *product, char *serial);
 MIRISDR_API int mirisdr_set_hw_flavour (mirisdr_dev_t *p, mirisdr_hw_flavour_t hw_flavour);
 

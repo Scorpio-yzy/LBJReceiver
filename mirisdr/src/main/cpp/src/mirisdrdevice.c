@@ -77,13 +77,32 @@ typedef struct {
     volatile long bytes;
     volatile int done;
     int ms;
-    struct timeval t0;
-    /* 直流估计：有符号数据 ≈ 0，无符号数据 ≈ 128。自检把它报出来，
-     * 万一自动判别判错，看一眼截图就知道该按哪种处理。 */
+    struct timeval t_first, t_last;   /* 速率只按"第一块到最后一块"算，不含收尾等待 */
+    /* 直流估计：有符号数据 ≈ 0，无符号数据 ≈ 128。自检报出来，判错了一眼就能看出来。 */
     long dc_sum;
     int dc_n;
     volatile int dc_mean;
+    /* 每块（一次回调）的长度：BULK 应该是 1024 的整数倍；ISOC 按微帧给，通常不是 */
+    long cb_count;
+    uint32_t cb_min, cb_max;
+    long cb_unaligned;
+    /* 字节直方图：最常见字节的占比能看出"是不是常量/空数据" */
+    long hist[256];
+    long hist_n;
 } miri_stream_probe_t;
+
+/* 一次"真收数据"测试的结果，直接拿去拼自检报告 */
+typedef struct {
+    int started;              /* mirisdr_read_async 的返回值 */
+    long bytes;
+    double rate;              /* 复数样点/秒 */
+    int dc_mean;
+    long cb_count;
+    uint32_t cb_min, cb_max;
+    long cb_unaligned;
+    int top_permille;         /* 最常见字节占比（千分比） */
+    int sync_loss;            /* 504 帧解析丢帧计数 */
+} miri_stream_result_t;
 
 /*
  * 客户端速率 -> 硬件速率 + 抽取倍数。
@@ -279,47 +298,62 @@ static void miri_stream_probe_cb(unsigned char *buf, uint32_t len, void *ctx)
     miri_stream_probe_t *s = (miri_stream_probe_t *) ctx;
     if (buf == NULL || len == 0)
         return;
+
+    struct timeval now;
+    gettimeofday(&now, NULL);
     if (s->bytes == 0)
-        gettimeofday(&s->t0, NULL);
+        s->t_first = now;
+    s->t_last = now;
     s->bytes += len;
+
+    /* 每块长度统计：BULK 每块是整 16 KB（若干整帧），ISOC 是"一微帧多少给多少" */
+    s->cb_count++;
+    if (s->cb_min == 0 || len < s->cb_min)
+        s->cb_min = len;
+    if (len > s->cb_max)
+        s->cb_max = len;
+    if ((len % 1024) != 0)
+        s->cb_unaligned++;
+
     if (s->dc_n < 32768) {
         for (uint32_t i = 0; i < len && s->dc_n < 32768; i++, s->dc_n++)
             s->dc_sum += buf[i];
         if (s->dc_n >= 16384)
             s->dc_mean = (int) (s->dc_sum / s->dc_n);
     }
-    struct timeval now;
-    gettimeofday(&now, NULL);
-    double el = (double) (now.tv_sec - s->t0.tv_sec) + (double) (now.tv_usec - s->t0.tv_usec) / 1e6;
+    if (s->hist_n < 262144) {
+        for (uint32_t i = 0; i < len && s->hist_n < 262144; i++, s->hist_n++)
+            s->hist[buf[i]]++;
+    }
+
+    double el = (double) (now.tv_sec - s->t_first.tv_sec)
+                + (double) (now.tv_usec - s->t_first.tv_usec) / 1e6;
     if (el >= (double) s->ms / 1000.0)
         mirisdr_cancel_async(s->dev);   /* 收够了就停，不用等看门狗 */
 }
 
 /*
- * 真收一段数据，返回实测速率（S/s，按 I+Q 两字节一个样点算）。收不到就返回 0。
- * Android 上 ISOC / BULK 哪个能用没有定论，所以自检两种都试，答案跟着结果一起回去。
- * 返回 -1 表示起流都没起来（状态没复位或被占用），0 表示起了但没数据。
+ * 真收一段数据，把"速率 / 每块长度 / 是否对齐 / 直流 / 字节分布 / 丢帧"全量出来。
+ *
+ * 为什么要这么多：用户手里没有 adb，只有手机上一屏弹窗。这几个量合起来能一次说清
+ *   · 速率不对      -> 传输方式或采样率的问题
+ *   · 每块不是 1024 整数倍 -> libmirisdr 的 504 解析会错位（ISOC 就是这样）
+ *   · 最常见字节占比很高   -> 数据是常量（设备没在采，或者帧内容为空）
+ *   · 丢帧计数很大         -> 流里真丢数据
  */
-/* 最近一次 miri_stream_test 量到的直流均值（给自检报告用） */
-static volatile int g_last_dc_mean = -1;
-
-static int miri_stream_last_dc(void)
-{
-    return g_last_dc_mean;
-}
-
-static double miri_stream_test(mirisdr_dev_t *dev, const char *mode, int ms, long *bytes_out,
-                               int *start_ret)
+static void miri_stream_test(mirisdr_dev_t *dev, const char *mode, int ms,
+                             miri_stream_result_t *out)
 {
     miri_stream_probe_t s;
     memset(&s, 0, sizeof(s));
+    memset(out, 0, sizeof(*out));
     s.dev = dev;
     s.ms = ms;
+    out->dc_mean = -1;
 
     if (mirisdr_set_transfer(dev, mode) != 0) {
-        *bytes_out = 0;
-        *start_ret = -100;
-        return -1;
+        out->started = -100;
+        return;
     }
 
     pthread_t wd;
@@ -329,24 +363,33 @@ static double miri_stream_test(mirisdr_dev_t *dev, const char *mode, int ms, lon
     if (has_wd)
         pthread_join(wd, NULL);
 
-    *bytes_out = s.bytes;
-    *start_ret = r;
-    g_last_dc_mean = (s.dc_n > 0) ? (int) (s.dc_sum / s.dc_n) : -1;
-    if (r != 0)
-        return -1;
-    if (s.bytes == 0)
-        return 0;
+    out->started = r;
+    out->bytes = s.bytes;
+    out->cb_count = s.cb_count;
+    out->cb_min = s.cb_min;
+    out->cb_max = s.cb_max;
+    out->cb_unaligned = s.cb_unaligned;
+    if (s.dc_n > 0)
+        out->dc_mean = (int) (s.dc_sum / s.dc_n);
+    if (s.hist_n > 0) {
+        long top = 0;
+        for (int i = 0; i < 256; i++)
+            if (s.hist[i] > top)
+                top = s.hist[i];
+        out->top_permille = (int) (top * 1000 / s.hist_n);
+    }
+    out->sync_loss = mirisdr_get_sync_loss(dev);
 
-    struct timeval end;
-    gettimeofday(&end, NULL);
-    double sec = (double) (end.tv_sec - s.t0.tv_sec) + (double) (end.tv_usec - s.t0.tv_usec) / 1e6;
-    if (sec <= 0)
-        return 0;
-    return (double) (s.bytes / 2) / sec;
+    if (r == 0 && s.bytes > 0) {
+        double sec = (double) (s.t_last.tv_sec - s.t_first.tv_sec)
+                     + (double) (s.t_last.tv_usec - s.t_first.tv_usec) / 1e6;
+        if (sec > 0)
+            out->rate = (double) (s.bytes / 2) / sec;   /* I+Q 两个字节一个复样点 */
+    }
 }
 
 /* 自检时试出来的、能出数据的方式。openAsync 用它，省得再试一遍。 */
-static char g_preferred_mode[8] = "ISOC";
+static char g_preferred_mode[8] = "BULK";
 
 static void miri_closed_cb(sdrtcp_t *tcp, void *ctx)
 {
@@ -534,48 +577,74 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jint
         n += snprintf(msg + n, sizeof(msg) - n, "读增益档位失败（%d）\n", ng);
     }
 
-    /* ---------- 真收一段数据：ISOC 和 BULK 哪个能出数 ---------- */
-    miri_trace(tracePath, "9 试收数据（ISOC）…");
-    long b_iso = 0;
-    int sr_iso = 0;
-    double rate_iso = miri_stream_test(dev, "ISOC", 700, &b_iso, &sr_iso);
-    int dc_iso = miri_stream_last_dc();
-    miri_trace(tracePath, "10 ISOC：起流返回 %d，收到 %ld 字节，实测 %.0f S/s，直流均值 %d",
-               sr_iso, b_iso, rate_iso, dc_iso);
-    MIRI_LOGI("ISOC: start=%d bytes=%ld rate=%.0f dc=%d", sr_iso, b_iso, rate_iso, dc_iso);
+    /*
+     * ---------- 真收一段数据 ----------
+     *
+     * ★ 先试 BULK，不是 ISOC。原因：
+     *   504 格式是"每 1024 字节一帧（16 字节帧头 + 1008 字节数据）"，libmirisdr 的解析器
+     *   要求【每次回调拿到的正好是若干整帧】。BULK 是整块（16 KB）给，天然对齐；
+     *   ISOC 是"每个微帧有多少给多少"（1.92 MS/s 时一微帧才几百字节），
+     *   解析器会把 16 字节帧头当成数据、还会越界读下一包 —— 出来的是错位的垃圾。
+     *   而且 ISOC 跑过之后接口往往还挂在 ISO 那档上，紧接着切 BULK 会失败，
+     *   这就是上一版"ISOC 有数据、BULK 起流失败"的由来。
+     */
+    miri_stream_result_t res_bulk, res_iso;
+    miri_trace(tracePath, "9 试收数据（BULK）…");
+    miri_stream_test(dev, "BULK", 900, &res_bulk);
+    miri_trace(tracePath, "10 BULK：起流=%d 字节=%ld 速率=%.0f 块数=%ld 块长 %u~%u 非1024倍数=%ld "
+                          "直流=%d 最常见字节=%d‰ 丢帧=%d",
+               res_bulk.started, res_bulk.bytes, res_bulk.rate, res_bulk.cb_count,
+               res_bulk.cb_min, res_bulk.cb_max, res_bulk.cb_unaligned, res_bulk.dc_mean,
+               res_bulk.top_permille, res_bulk.sync_loss);
 
-    miri_trace(tracePath, "11 试收数据（BULK）…");
-    long b_bulk = 0;
-    int sr_bulk = 0;
-    double rate_bulk = miri_stream_test(dev, "BULK", 700, &b_bulk, &sr_bulk);
-    miri_trace(tracePath, "12 BULK：起流返回 %d，收到 %ld 字节，实测 %.0f S/s", sr_bulk, b_bulk,
-               rate_bulk);
-    MIRI_LOGI("BULK: start=%d bytes=%ld rate=%.0f", sr_bulk, b_bulk, rate_bulk);
+    if (res_bulk.rate > 0) {
+        snprintf(g_preferred_mode, sizeof(g_preferred_mode), "BULK");
+        res_iso = res_bulk;
+        res_iso.rate = -1;       /* ISOC 没试过，报告里标一下 */
+    } else {
+        miri_trace(tracePath, "11 试收数据（ISOC，BULK 没出数据才试）…");
+        miri_stream_test(dev, "ISOC", 900, &res_iso);
+        miri_trace(tracePath, "12 ISOC：起流=%d 字节=%ld 速率=%.0f 块数=%ld 块长 %u~%u 非1024倍数=%ld "
+                              "直流=%d 最常见字节=%d‰ 丢帧=%d",
+                   res_iso.started, res_iso.bytes, res_iso.rate, res_iso.cb_count,
+                   res_iso.cb_min, res_iso.cb_max, res_iso.cb_unaligned, res_iso.dc_mean,
+                   res_iso.top_permille, res_iso.sync_loss);
+        snprintf(g_preferred_mode, sizeof(g_preferred_mode), "%s",
+                 res_iso.rate > 0 ? "ISOC" : "BULK");
+    }
+    MIRI_LOGI("取数方式选定：%s", g_preferred_mode);
 
-    const char *mode_pick;
-    if (rate_iso > 0.0 && rate_iso >= rate_bulk)
-        mode_pick = "ISOC";
-    else if (rate_bulk > 0.0)
-        mode_pick = "BULK";
-    else
-        mode_pick = "ISOC";      /* 两个都没数：按默认值起，失败原因看下面的说明 */
-    snprintf(g_preferred_mode, sizeof(g_preferred_mode), "%s", mode_pick);
-
-    n += snprintf(msg + n, sizeof(msg) - n, "\n真收一段数据（各 0.7 秒，1.92M 是正常的）：\n");
-    if (rate_iso > 0)
-        n += snprintf(msg + n, sizeof(msg) - n, "  ISOC：收到数据，实测 %.2f MS/s，直流均值 %d（%s）\n",
-                      rate_iso / 1e6, dc_iso,
-                      dc_iso >= 64 ? "无符号" : "有符号，驱动会自动 +128");
-    else
-        n += snprintf(msg + n, sizeof(msg) - n, "  ISOC：%s\n",
-                      sr_iso == 0 ? "起流了但没数据" : "起流失败");
-    if (rate_bulk > 0)
-        n += snprintf(msg + n, sizeof(msg) - n, "  BULK：收到数据，实测 %.2f MS/s\n",
-                      rate_bulk / 1e6);
-    else
-        n += snprintf(msg + n, sizeof(msg) - n, "  BULK：%s\n",
-                      sr_bulk == 0 ? "起流了但没数据" : "起流失败");
-    n += snprintf(msg + n, sizeof(msg) - n, "  采用的取数方式：%s\n", mode_pick);
+    /* 一行一块，尽量短，能一屏看完 */
+    n += snprintf(msg + n, sizeof(msg) - n, "\n真收一段数据（应约 1.92 MS/s）：\n");
+    const char *names[2] = {"BULK", "ISOC"};
+    const miri_stream_result_t *rs[2] = {&res_bulk, &res_iso};
+    for (int k = 0; k < 2; k++) {
+        const miri_stream_result_t *x = rs[k];
+        if (x->rate < 0)
+            continue;                                    /* 这次没试（BULK 已经好了） */
+        if (x->rate > 0) {
+            n += snprintf(msg + n, sizeof(msg) - n,
+                          "  %s：%.2f MS/s，块 %ld 个（%u~%u 字节，非 1024 倍数 %ld 个），"
+                          "丢帧 %d，直流均值 %d，最常见字节 %d‰\n",
+                          names[k], x->rate / 1e6, x->cb_count, x->cb_min, x->cb_max,
+                          x->cb_unaligned, x->sync_loss, x->dc_mean, x->top_permille);
+        } else if (x->started == 0) {
+            n += snprintf(msg + n, sizeof(msg) - n, "  %s：起流了但一个字节都没收到\n", names[k]);
+        } else {
+            n += snprintf(msg + n, sizeof(msg) - n, "  %s：起流失败（%d）\n", names[k], x->started);
+        }
+    }
+    if (res_bulk.rate > 0) {
+        n += snprintf(msg + n, sizeof(msg) - n,
+                      "  采用的取数方式：BULK（整块传输，504 帧天然对齐）\n");
+    } else if (res_iso.rate > 0) {
+        n += snprintf(msg + n, sizeof(msg) - n,
+                      "  采用的取数方式：ISOC（BULK 没出数据；ISOC 按微帧给数据，"
+                      "块长不是 1024 的整数倍就会有错位）\n");
+    } else {
+        n += snprintf(msg + n, sizeof(msg) - n,
+                      "  两种取数方式都没收到数据 —— 把这一屏发我\n");
+    }
 
     miri_trace(tracePath, "13 关闭设备…");
     mirisdr_close(dev);

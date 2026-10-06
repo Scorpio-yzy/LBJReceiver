@@ -349,6 +349,17 @@ int mirisdr_get_usb_strings (mirisdr_dev_t *dev, char *manufact, char *product, 
     return 0;
 }
 
+/*
+ * ★ 本项目新增：把 504 帧解析里的"丢帧计数"暴露出来。
+ * 504 格式每 1024 字节一帧（16 字节帧头 + 1008 字节数据），解析器拿帧头里的地址和
+ * 预期值对不上就会 +1。这个数能直接说明"我们拿到的数据流是不是对齐的"，
+ * 而用户手里没有 logcat，只能靠 App 把它显示出来。
+ */
+int mirisdr_get_sync_loss (mirisdr_dev_t *p) {
+    if (!p) return -1;
+    return p->sync_loss_cnt;
+}
+
 int mirisdr_set_hw_flavour (mirisdr_dev_t *p, mirisdr_hw_flavour_t hw_flavour) {
     if (!p) goto failed;
 
