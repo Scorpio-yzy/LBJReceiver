@@ -230,6 +230,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
     private var radioMode = "NFM"
     private var lastRssi = -140.0
     private var lastRadioErr = ""          // 收音机错误（数据源卡住/解调失败…）只在变化时提示一次
+    private var lastModeHint = ""           // 上次提示过的"频段与制式不匹配"，避免每次轮询都弹
     private var lastSquelchDb = 12.0       // 高于底噪多少 dB
     private var lastThreshold = -95.0      // 实际生效的门限（底噪 + 上面的值）
     private var lastFloor = -140.0
@@ -1406,6 +1407,25 @@ private const val FULL_STOP_DELAY_MS = 120000L
     }
 
     // ---------------------------------------------------------- 轮询刷新
+    /**
+     * 频段 -> 该用哪种制式；当前制式已经对了、或者频段不属于任何典型段，返回 null。
+     *
+     * ★ 为什么要做这个：手台/对讲/铁路联控是 **NFM**（窄带），广播才是 **WFM**。
+     *   用 WFM 去收 NFM 手台，鉴频器输出幅度极小 —— 听上去就是"完全没有声音"，
+     *   而界面上 RSSI 可能还是正常的。远程测试时用户只会报"没声音"，
+     *   所以这里把建议直接摆在状态行上（截图就能看到），只在变化时弹一次提示。
+     */
+    private fun suggestRadioMode(hz: Double): String? {
+        val m = hz / 1e6
+        val want = when {
+            m in 87.0..108.0 -> "WFM"        // 调频广播
+            m in 118.0..137.0 -> "AM"        // 航空
+            m in 136.0..520.0 -> "NFM"       // 对讲/调机/铁路联控（457.725 就在这段）
+            else -> return null
+        }
+        return if (radioMode == want) null else want
+    }
+
     private fun startRadioPoll() {
         if (radioPolling) return
         radioPolling = true
@@ -1567,10 +1587,27 @@ private const val FULL_STOP_DELAY_MS = 120000L
             o.optBoolean("open", false) -> "有声"
             else -> "静噪中"
         }
-        tvRadioStatus.text = String.format(
+        var statusText = String.format(
             Locale.US, "%s   RSSI %.0f   门限 %.0f   %s",
             radioMode, lastRssi, lastThreshold, st
         )
+        // 频段与制式不匹配：摆到状态行上（截图能带回来），并提示一次
+        val suggest = suggestRadioMode(radioFreqHz)
+        if (suggest != null) {
+            statusText += "   ⚠ 该频段用 " + suggest
+            val key = suggest + "@" + Math.round(radioFreqHz / 1e5)
+            if (key != lastModeHint) {
+                lastModeHint = key
+                toast(when (suggest) {
+                    "NFM" -> "这个频段（对讲/调机）一般用 NFM，点【制式】切换"
+                    "AM" -> "航空段一般用 AM，点【制式】切换"
+                    else -> "广播段一般用 WFM，点【制式】切换"
+                })
+            }
+        } else {
+            lastModeHint = ""
+        }
+        tvRadioStatus.text = statusText
         val arr = o.optJSONArray("spectrum")
         if (arr != null && arr.length() > 0) {
             val v = FloatArray(arr.length())

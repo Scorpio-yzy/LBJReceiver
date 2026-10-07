@@ -652,6 +652,30 @@ class _A2:
                     self._error = 'TCP连接断开'
                     return
                 hdr += buf
+            # ★ 握手包里有【真实调谐器型号】—— 以前读掉就扔了，增益于是只能靠"设置里
+            #   选的型号"猜；设置默认是 FC0013（档位表上限只有 19.7dB），装的是 R820T 的
+            #   棒子就会被压到 19.7；反过来也一样。现在把它记下来，增益档位表以设备为准。
+            #   magic "MIRI" = 本机 Mirics(RSP1) 服务，它的 dongleType 字段借用 RTL 的枚举，
+            #   不能按数值解释，必须先用 magic 分开。
+            try:
+                magic = hdr[0:4]
+                dtype = int.from_bytes(hdr[4:8], 'big')
+                dgains = int.from_bytes(hdr[8:12], 'big')
+                if magic == b'MIRI':
+                    hint = 'OTHER'
+                elif magic == b'RTL0':
+                    hint = {2: 'FC0013', 3: 'FC0013', 5: 'R820T', 6: 'R820T'}.get(dtype)
+                else:
+                    hint = None
+                _g2['dongle_magic'] = magic.decode('ascii', 'replace')
+                _g2['dongle_type'] = dtype
+                _g2['dongle_gains'] = dgains
+                _g2['tuner_hint'] = hint
+                print('LBJ: 驱动握手 magic=%s type=%d gains=%d -> 增益档位表 %s'
+                      % (magic.decode('ascii', 'replace'), dtype, dgains,
+                         hint or '(按设置)'), flush=True)
+            except Exception as e:
+                print('LBJ-ERR 解析握手包失败: %s' % e, flush=True)
             # ★ 保持一个超时，不能设成 None：
             #   数据源一旦卡住（驱动 USB 事件循环停摆、连接半死），read() 会永远阻塞，
             #   界面看着还是"接收中"，其实早就没数据了，而且永远不会自愈。

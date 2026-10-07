@@ -307,7 +307,14 @@ def snap_gain(tuner, db):
       真机现象正是"能解码列车、但收音机声音很小，而且调了增益没反应"。
       预警器这边早就修过同一处，收音机漏了；现在两边都走这个函数。
     """
-    t = str(tuner or '').upper()
+    # ★ 以【设备自报的型号】为准（rtl_tcp 握手包里的 magic/dongleType，见 lbj_ref._reader_task）。
+    #   设置里那个型号是人工选的，默认值经常跟真实硬件不一致 —— 用错表时 RTL 侧会把
+    #   增益压到 FC0013 表的上限 19.7dB，表现就是"手台在旁边发射都听不到"。
+    try:
+        hint = R._g2.get('tuner_hint')
+    except Exception:
+        hint = None
+    t = str(hint or tuner or '').upper()
     if (t.startswith('OTHER') or t.startswith('NET') or t.startswith('RSP')
             or t.startswith('SOAPY')):
         table = _PASSTHROUGH_GAINS
