@@ -3254,11 +3254,13 @@ private const val FULL_STOP_DELAY_MS = 120000L
             }
             try { conn.close() } catch (_: Throwable) { }
             main.post {
+                val bad = res.contains("失败") || res.contains("异常")
                 AlertDialog.Builder(this)
                     .setTitle("自检结果  " +
                         String.format(Locale.US, "%04X:%04X", dev.vendorId, dev.productId))
                     .setMessage(res + "\n\n前端波段表：" +
-                        (if (hw == 1) "SDRplay（RSP1/RSP1A/RSP2）" else "通用 MSi2500"))
+                        (if (hw == 1) "SDRplay（RSP1/RSP1A/RSP2）" else "通用 MSi2500") +
+                        (if (bad) "\n\n── 诊断 ──\n" + miriDiagText(dev) else ""))
                     .setPositiveButton("启动驱动") { _, _ -> rsp1Start(usb, dev) }
                     .setNegativeButton("关闭", null)
                     .show()
@@ -3380,6 +3382,34 @@ private const val FULL_STOP_DELAY_MS = 120000L
     private fun miriTraceFile(): File = File(filesDir, "miri_probe.log")
 
     /**
+     * 失败时要一并告诉用户的东西——用户只能给截图，所以一定要把
+     * “到底哪一步失败”摆到屏幕上：
+     *   ① native 侧留下的确切错误（claim_interface 错误码、设备节点读不到、内核驱动占用…）；
+     *   ② 设备的 USB 描述符（类/接口数）—— 能看出是不是被内核 DVB 驱动占着；
+     *   ③ 自检步骤记录的尾巴（fsync 落盘的，崩了也在）。
+     */
+    private fun miriDiagText(dev: UsbDevice): String {
+        val sb = StringBuilder()
+        try {
+            val e = miriDevice?.lastOpenError()
+            if (!e.isNullOrEmpty()) sb.append("native 错误：").append(e).append('\n')
+        } catch (_: Throwable) { }
+        sb.append(String.format(java.util.Locale.US, "USB：%04X:%04X 设备类 %d、接口 %d 个",
+            dev.vendorId, dev.productId, dev.deviceClass, dev.interfaceCount))
+        for (i in 0 until minOf(dev.interfaceCount, 3)) {
+            val itf = dev.getInterface(i)
+            sb.append(String.format(java.util.Locale.US, "  [%d] class=%d sub=%d proto=%d",
+                i, itf.interfaceClass, itf.interfaceSubclass, itf.interfaceProtocol))
+        }
+        sb.append('\n')
+        val t = try { if (miriTraceFile().exists()) miriTraceFile().readText().trim() else "" } catch (_: Throwable) { "" }
+        if (t.isNotEmpty()) sb.append("步骤记录：\n").append(t.takeLast(700))
+        val out = sb.toString()
+        android.util.Log.i("MiriSdrDriver", "诊断：" + out.replace('\n', ' '))
+        return out
+    }
+
+    /**
      * 进界面时看一眼上次自检跑完了没有：没有最后那行"自检结束"就说明 native 崩了，
      * 把落盘的最后几步显示出来。
      * 装到别人手机上时用户没有 adb、没有 logcat —— 这是唯一能把崩溃点带回来的渠道。
@@ -3474,7 +3504,8 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 }
                 AlertDialog.Builder(this)
                     .setTitle("驱动没起来")
-                    .setMessage("试了两次都没起来。\n\n设备：" + usbLine(dev) + "\n原因：" + why + "\n\n" +
+                    .setMessage("试了两次都没起来。\n\n设备：" + usbLine(dev) + "\n原因：" + why +
+                        "\n\n── 诊断 ──\n" + miriDiagText(dev) + "\n\n" +
                         "① 设备被占用：把别的 SDR / 收音机 / 电视 App 全清掉，拔了重插再试一次\n" +
                         "② 采样率或频率回读是 0：这颗板子的时钟/固件跟通用 Mirics 不一样，" +
                         "请把【自检结果】那一屏截图发我\n" +

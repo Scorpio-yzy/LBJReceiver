@@ -63,6 +63,7 @@ MIRISDR_API int mirisdr_close (mirisdr_dev_t *p);
 MIRISDR_API int mirisdr_reset (mirisdr_dev_t *p);                       /* extra */
 MIRISDR_API int mirisdr_reset_buffer (mirisdr_dev_t *p);
 MIRISDR_API int mirisdr_get_sync_loss (mirisdr_dev_t *p);   /* 本项目新增：504 帧解析丢帧计数 */
+MIRISDR_API const char *mirisdr_last_open_error (void);     /* 本项目新增：打开失败的确切原因 */
 MIRISDR_API int mirisdr_get_last_frame_header (mirisdr_dev_t *p, unsigned char *out16); /* 本项目新增 */
 MIRISDR_API int mirisdr_test_control_transfer (mirisdr_dev_t *p);  /* 本项目新增：写寄存器返回码 */
 MIRISDR_API int mirisdr_test_streaming_start (mirisdr_dev_t *p);   /* 本项目新增：开始串流命令返回码 */

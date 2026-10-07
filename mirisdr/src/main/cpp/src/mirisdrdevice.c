@@ -586,7 +586,11 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jlon
     if (devicePath != NULL)
         (*env)->ReleaseStringUTFChars(env, devicePath_, devicePath);
     if (r != 0 || dev == NULL) {
-        snprintf(msg, sizeof(msg), "打开设备失败（mirisdr_open_fd 返回 %d）", r);
+        /* 把具体哪一步、什么错误码一并写出来 —— 用户只能给截图，
+         * 只写"返回 -1"等于什么都没说。 */
+        const char *why = mirisdr_last_open_error();
+        snprintf(msg, sizeof(msg), "打开设备失败（mirisdr_open_fd 返回 %d）\n原因：%s",
+                 r, (why && why[0]) ? why : "（无详情）");
         MIRI_LOGE("%s", msg);
         miri_trace(tracePath, "1 打开设备失败：%d（自检结束）", r);
         if (tracePath != NULL) (*env)->ReleaseStringUTFChars(env, tracePath_, tracePath);
@@ -844,7 +848,7 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_openAsync(
 
     int r = mirisdr_open_fd(&dev, (int) fd);
     if (r != 0 || dev == NULL) {
-        MIRI_LOGE("mirisdr_open_fd 失败: %d", r);
+        MIRI_LOGE("mirisdr_open_fd 失败: %d（%s）", r, mirisdr_last_open_error());
         goto rel_jni;
     }
     /* 这里原来调 mirisdr_get_device_name()：它在 Android 上要重新 libusb_init + 枚举整条
@@ -947,6 +951,14 @@ rel_jni:
     if (mode_from_jni)
         (*env)->ReleaseStringUTFChars(env, mode_, mode);
     return ok;
+}
+
+/* 最后一次打开失败的确切原因（给界面显示）。 */
+JNIEXPORT jstring JNICALL
+Java_com_railfan_lbj_mirisdr_MiriSdrDevice_lastOpenError(JNIEnv *env, jobject thiz)
+{
+    (void) thiz;
+    return (*env)->NewStringUTF(env, mirisdr_last_open_error());
 }
 
 /* 自检试出来的、能出数据的取数方式（"ISOC" / "BULK"）。App 启动驱动时照这个来。 */

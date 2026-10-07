@@ -6,6 +6,9 @@
 #include <string.h>
 #include <unistd.h>
 
+/* 由 libmirisdr.c 提供：把失败原因存成字符串，界面上显示用 */
+extern void mirisdr_set_open_error(const char *fmt, ...);
+
 static char g_dev_path[256];
 
 void mirisdr_set_android_device_path(const char *path)
@@ -53,12 +56,16 @@ int LIBUSB_CALL libusb_wrap_sys_device(libusb_context *ctx, intptr_t sys_dev,
     }
     if (path[0] != '/') {
         /* 两条路都没有：明确报"没有这个设备"，让上层给出可读的提示 */
+        mirisdr_set_open_error("拿不到设备节点路径（/proc/self/fd 反查失败，且 App 也没传进来）");
         return LIBUSB_ERROR_NO_DEVICE;
     }
 
     libusb_device *dev = libusb_get_device2(ctx, path);
-    if (!dev)
+    if (!dev) {
+        /* 这一步要读 /sys/bus/usb/devices 里的描述符：部分手机（SELinux）不让 App 读，于是设备对象建不出来 */
+        mirisdr_set_open_error("从设备节点\"%s\"构造 libusb_device 失败（多半是 /sys/bus/usb 读不到）", path);
         return LIBUSB_ERROR_NO_DEVICE;
+    }
 
     /*
      * ★ 本项目在 Android 上新增的改动：把 Java 交下来的 fd【复制一份】再给 libusb。
@@ -72,8 +79,14 @@ int LIBUSB_CALL libusb_wrap_sys_device(libusb_context *ctx, intptr_t sys_dev,
      * 所有 USBDEVFS ioctl（claim / alt setting / 提交 URB）全都照常工作。
      */
     int myfd = dup((int) sys_dev);
-    if (myfd < 0)
+    if (myfd < 0) {
+        mirisdr_set_open_error("dup(fd=%d) 失败：fd 已失效", (int) sys_dev);
         return LIBUSB_ERROR_NO_DEVICE;
+    }
 
-    return libusb_open2(dev, dev_handle, myfd);
+    int rc = libusb_open2(dev, dev_handle, myfd);
+    if (rc < 0)
+        mirisdr_set_open_error("libusb_open2(fd=%d) 失败：code %d (%s)",
+                               (int) sys_dev, rc, libusb_error_name(rc));
+    return rc;
 }

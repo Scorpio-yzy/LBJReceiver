@@ -25,6 +25,12 @@ ADD_LIBRARY( mirisdr SHARED ${SOURCES_LIB} )
 #   把 src 放进 -I 会让兼容层里的 <libusb.h> 又命中它自己，真头文件就永远进不来。
 TARGET_INCLUDE_DIRECTORIES( mirisdr PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/libmirisdr/include" )
+
+# ★ 打开 DETACH_KERNEL_DRIVER：有些手机的内核自带 MSi2500/MSi001 的 DVB 驱动
+#   （msi2500 / dvb-usb-msi2500），会把接口先占住 —— 这时 libusb_claim_interface 必然失败，
+#   表现就是"设备认得出来、但 mirisdr_open_fd 返回 -1"（真机反馈就是这样）。
+#   打开之后 libmirisdr 会先 libusb_detach_kernel_driver() 把内核驱动摎掉再 claim。
+TARGET_COMPILE_DEFINITIONS( mirisdr PRIVATE DETACH_KERNEL_DRIVER )
 TARGET_LINK_LIBRARIES( mirisdr ${LOG_LIB} libusb_miri )
 
 TARGET_LINK_OPTIONS( mirisdr PRIVATE

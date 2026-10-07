@@ -19,6 +19,7 @@
 /* potřebné funkce */
 #include <errno.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,6 +55,26 @@
 #include "soft.c"
 #include "sync.c"
 
+/*
+ * ★ 本项目新增：把"打开失败的确切原因"留下来。
+ *
+ * 上游在失败路径上只 fprintf(stderr) —— 而手机上根本看不到 stderr，
+ * 用户能给的只有一张自检截图，于是"mirisdr_open_fd 返回 -1"就成了死胡同。
+ * 这里把原因存成字符串，由 mirisdr_last_open_error() 取出来显示在界面上。
+ */
+static char g_open_err[192];
+
+void mirisdr_set_open_error (const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_open_err, sizeof(g_open_err), fmt, ap);
+    va_end(ap);
+}
+
+const char *mirisdr_last_open_error (void) {
+    return g_open_err[0] ? g_open_err : "";
+}
+
 int mirisdr_setup (mirisdr_dev_t **out_dev, mirisdr_dev_t *dev) {
     int r;
 
@@ -65,6 +86,7 @@ int mirisdr_setup (mirisdr_dev_t **out_dev, mirisdr_dev_t *dev) {
             fprintf(stderr, "Detached kernel driver\n");
         } else {
             fprintf(stderr, "Detaching kernel driver failed!");
+            mirisdr_set_open_error("内核驱动占着接口，且摘除失败（SELinux 可能不允许 USBDEVFS_DISCONNECT）");
             dev->driver_active = 0;
             goto failed;
         }
@@ -82,6 +104,8 @@ int mirisdr_setup (mirisdr_dev_t **out_dev, mirisdr_dev_t *dev) {
 
     if ((r = libusb_claim_interface(dev->dh, 0)) < 0) {
         fprintf(stderr, "failed to claim miri usb device %u with code %d: %s\n", dev->index, r, libusb_error_name(r));
+        mirisdr_set_open_error("claim_interface 失败：code %d (%s)%s", r, libusb_error_name(r),
+                               r == LIBUSB_ERROR_BUSY ? " —— 接口被内核驱动或另一个程序占着" : "");
         if (r == LIBUSB_ERROR_BUSY) {
             fprintf(stderr, "Verify that the SDRplay background service is not running by `sudo systemctl stop sdrplay` and try again.\n");
         }

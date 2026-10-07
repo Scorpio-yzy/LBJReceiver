@@ -50,6 +50,9 @@ public class MiriSdrDevice {
                                     int port, int ppm, int biasT, String address, String devicePath,
                                     int hwFlavour, String mode);
 
+    /** 最后一次打开失败的确切原因（界面上显示，截图能带回来）。 */
+    public native String lastOpenError();
+
     /** 自检里试出来的、真能收到数据的取数方式（"ISOC" / "BULK"）。 */
     public native String preferredMode();
 
