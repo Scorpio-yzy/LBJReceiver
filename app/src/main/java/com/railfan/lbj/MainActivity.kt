@@ -1320,6 +1320,12 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 re.callAttr("set_volume", prefs.getFloat("rvol", 0.8f).toDouble())
                 re.callAttr("set_squelch", lastSquelchDb)
                 re.callAttr("set_squelch_on", lastSqlOn)
+                // ★ 调谐器型号必须排在 set_gain 之前：它决定用哪张增益档位表。
+                //   收音机这边原先走参考实现的 _ag()（写死按 R820T 表吸附，最大 49.6dB），
+                //   而 RSP1 是 OTHER 直通表（0~102dB），用户填 60~80 会被悄悄压回去 ——
+                //   真机现象就是"能解码列车、但收音机声音很小，怎么调增益都没反应"。
+                re.callAttr("set_tuner", prefs.getString("tuner",
+                    if (prefs.getBoolean("fc0013", true)) "FC0013" else "R820T"))
                 re.callAttr("set_gain", prefs.getFloat("gain", 19.7f).toDouble())
                 re.callAttr("set_ppm", prefs.getInt("ppm", 0))
                 if (!re.callAttr("start").toBoolean()) {
@@ -4052,9 +4058,23 @@ private const val FULL_STOP_DELAY_MS = 120000L
                         //   顺序反了的话用户刚填的增益会被再吸附一次（虽然结果一样，但语义不清）。
                         eng.callAttr("set_tuner", tunerVals[tunerIdx])
                         eng.callAttr("set_frequency", freq.toDouble())
-                        val actual = eng.callAttr("set_gain", gain.toDouble()).toDouble()
+                        // ★ 收音机模式下数据源在【收音机引擎】手里（探测器 take_source 时把 _src
+                        //   置成了 None），往探测器下发 set_gain/set_ppm 会被静默丢弃（内部
+                        //   "if self._src is not None" 直接跳过）—— 用户一边听一边调增益完全没反应。
+                        //   谁握着数据源就下给谁；预报器那边也调一次，让它的增益状态与 _g2 保持同步
+                        //   （它此时没有 _src，不会重复下发）。
+                        val reHolding = if (inRadio) radioEngine else null
+                        val actual: Double
+                        if (reHolding != null) {
+                            reHolding.callAttr("set_tuner", tunerVals[tunerIdx])
+                            actual = reHolding.callAttr("set_gain", gain.toDouble()).toDouble()
+                            reHolding.callAttr("set_ppm", ppm)
+                            eng.callAttr("set_gain", actual)
+                        } else {
+                            actual = eng.callAttr("set_gain", gain.toDouble()).toDouble()
+                            eng.callAttr("set_ppm", ppm)
+                        }
                         prefs.edit().putFloat("gain", actual.toFloat()).apply()
-                        eng.callAttr("set_ppm", ppm)
                         eng.callAttr("set_threshold", thr.toDouble())
                         eng.callAttr("set_hold_ms", hold.toDouble())
                         eng.callAttr("set_afc_enabled", cAfc.isChecked)

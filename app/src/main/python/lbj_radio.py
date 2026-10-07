@@ -279,6 +279,9 @@ class RadioEngine:
         self._ctcss_ok = False
         self._ctcss_buf = np.zeros(0, dtype=np.float64)
         self._gain_db = 19.7
+        # 增益用哪张档位表由调谐器型号决定（OTHER = RSP1 这类网络源，直通 -20~102dB）。
+        # 必须先于 set_gain 设好，否则会按 R820T 的表把 RSP1 的增益压到 49.6 以下。
+        self._tuner = 'R820T'
         self._ppm = 0
 
         # 硬件（调谐器）实际停在哪 —— 软件换频要拿它算 DDC 偏移
@@ -376,13 +379,33 @@ class RadioEngine:
         if self._ctcss > 0:
             print('LBJ: 收音机亚音 → %.1f Hz' % self._ctcss, flush=True)
 
+    def set_tuner(self, name):
+        """记录调谐器型号 —— 决定增益用哪张档位表（'OTHER' = RSP1 这类网络源，直通）。"""
+        self._tuner = str(name or 'R820T')
+        return self._tuner
+
+    def gain_apply(self):
+        """把当前增益下发给数据源（按当前调谐器的表吸附过）。
+
+        ★ 不用参考实现的 _src._ag()：它写死按 R820T 表吸附（最大 49.6 dB），
+          对 RSP1/RSP2（0~102 dB）会把用户填的 60~80 dB 悄悄压回去 ——
+          真机现象就是"能解码列车、但收音机声音很小，而且怎么调增益都没反应"。
+          这里和预警器走同一个 snap_gain()，再直接下发 rtl_tcp 命令。
+        """
+        if self._src is None:
+            return
+        try:
+            self._src._send_cmd(R.CMD_SET_GAINMODE, 1)
+            self._src._send_cmd(R.CMD_SET_GAIN, int(round(self._gain_db * 10)))
+        except Exception as e:
+            print('LBJ-ERR 收音机增益下发失败: %s' % e, flush=True)
+
     def set_gain(self, db):
-        self._gain_db = float(db)
-        if self._src is not None:
-            try:
-                self._src._ag(self._gain_db)
-            except Exception:
-                pass
+        """设增益。返回吸附后的实际值（界面显示用）。"""
+        self._gain_db = lbj_engine.snap_gain(self._tuner, db)
+        R._g2['gain'] = self._gain_db      # 预警器重连时会用这个值重新下发
+        self.gain_apply()
+        return self._gain_db
 
     def set_ppm(self, ppm):
         """设频偏校正（ppm）。
@@ -418,10 +441,10 @@ class RadioEngine:
             return
         try:
             self._src._af(self._freq)
-            self._src._ag(self._gain_db)
             self._src._ah(self._ppm)
         except Exception:
             pass
+        self.gain_apply()       # 走统一的吸附+下发（不能用 _ag：它写死按 R820T 表）
 
     def has_source(self):
         return self._src is not None

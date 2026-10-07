@@ -298,6 +298,26 @@ FC0013_GAINS = [-9.9, -7.3, -6.5, -6.3, -6.0, -5.8, -5.4,
 _PASSTHROUGH_GAINS = [round(-20.0 + 0.5 * i, 1) for i in range(0, 245)]
 
 
+def snap_gain(tuner, db):
+    """按调谐器型号把增益吸附到有效档位 —— 预警器和收音机共用这一套。
+
+    ★ 为什么必须共用：收音机那边原先调参考实现的 _src._ag()，而它【写死按 R820T 的表】
+      吸附（最大 49.6 dB）。RSP1/RSP2 走的是 'OTHER' 直通表（-20~102 dB），
+      套上 R820T 的表就会把用户填的 60~80 dB 悄悄压回 49.6 以下 ——
+      真机现象正是"能解码列车、但收音机声音很小，而且调了增益没反应"。
+      预警器这边早就修过同一处，收音机漏了；现在两边都走这个函数。
+    """
+    t = str(tuner or '').upper()
+    if (t.startswith('OTHER') or t.startswith('NET') or t.startswith('RSP')
+            or t.startswith('SOAPY')):
+        table = _PASSTHROUGH_GAINS
+    elif t.startswith('FC'):
+        table = FC0013_GAINS
+    else:
+        table = R.R820T_GAINS
+    return float(min(table, key=lambda x: abs(x - float(db))))
+
+
 _SELFTEST_LOCK = threading.RLock()
 _SELFTEST_ACTIVE = False
 _SELFTEST_STARTED_AT = 0.0
@@ -1487,7 +1507,7 @@ class LbjEngine:
         # 无论 _src 在不在，都先按当前调谐器吸附：
         #   _src 为 None 时（applyPrefs 就在这个阶段调用）也必须吸附，
         #   否则 _A2._reader_task 建连后会用 R._g2['gain'] 下发一个无效值。
-        self.gain_db = float(min(self._gain_table(), key=lambda x: abs(x - self.gain_db)))
+        self.gain_db = snap_gain(self.tuner, self.gain_db)
         if self._src is not None:
             try:
                 self._src._send_cmd(R.CMD_SET_GAINMODE, 1)
