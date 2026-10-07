@@ -1099,8 +1099,9 @@ private const val FULL_STOP_DELAY_MS = 120000L
 
     /** 未启动时，在标题栏里直接显示"驱动到底行不行"，不用等点了开始再猜 */
     private fun refreshDriverStatus() {
-        // 从后台回来 / 刚插上设备时也自动切一次（挂在 UI 线程，内部只改 prefs + 起后台线程）
-        autoSelectDriver()
+        // 从后台回来 / 刚插上设备时只把配置切好，**不起驱动**：
+        //   起了就会占住设备，用户再点【自检】必然拿到 LIBUSB_ERROR_BUSY。
+        autoSelectDriver(startNow = false)
         Thread {
             val bench = prefs.getBoolean("bench", false)
             val builtin = prefs.getBoolean("builtin", true)
@@ -2747,7 +2748,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                             // ★ 插着 RSP1 却连不上：多半是驱动没起来（或拔插过后死了）。
                             //   自动把"已起过"的标志清掉、重新起一次驱动，然后重走完整流程 ——
                             //   这样用户就不必手动点【自检】。只自动重试一次，避免打转。
-                            if (!autoRetried) {
+                            if (!autoRetried && !miriDriverUp) {
                                 val u2 = getSystemService(Context.USB_SERVICE) as UsbManager
                                 val cand = u2.deviceList.values.toList()
                                 val d2 = cand.firstOrNull { isMiriKnown(it) }
@@ -3223,8 +3224,27 @@ private const val FULL_STOP_DELAY_MS = 120000L
         val usb = getSystemService(Context.USB_SERVICE) as UsbManager
         val name = dev.deviceName
         val hw = miriHwFlavour(dev)
+        // ★ 自检要【独占】设备：正在跑的驱动拿着接口，不先关掉就必然
+        //   claim_interface 失败 -6 (LIBUSB_ERROR_BUSY) —— 真机反馈就是这个：
+        //   一打开 App 自动起了驱动，之后点自检就去开同一个设备，直接被自己挡住。
+        val takeover = miriDriverUp || miriConn != null || miriDevice != null
         toast("正在自检…（结果会弹出来）")
         Thread {
+            if (takeover) {
+                // close() 会 mirisdr_close → libusb_release_interface + libusb_close，
+                // 内核随之放掉这个接口；之后必须换一个全新的 MiriSdrDevice（句柄已失效）。
+                try { miriDevice?.close(miriDevice!!.handle()) } catch (_: Throwable) { }
+                miriDevice = null
+                try { miriConn?.close() } catch (_: Throwable) { }
+                miriConn = null
+                miriDriverUp = false
+                // 刚才是我们主动关的，别让 15 秒节流挡住随后的【开始接收】
+                miriStartAt = 0L
+                autoRetried = false
+                main.post { toast("已临时停掉在跑的 RSP1 驱动（自检需要独占设备）") }
+                // 内核释放接口有一点点延迟，抢着开还是 BUSY
+                try { Thread.sleep(400) } catch (_: InterruptedException) { }
+            }
             val conn = try { usb.openDevice(dev) } catch (t: Throwable) { null }
             if (conn == null) {
                 main.post {
@@ -3260,7 +3280,12 @@ private const val FULL_STOP_DELAY_MS = 120000L
                         String.format(Locale.US, "%04X:%04X", dev.vendorId, dev.productId))
                     .setMessage(res + "\n\n前端波段表：" +
                         (if (hw == 1) "SDRplay（RSP1/RSP1A/RSP2）" else "通用 MSi2500") +
-                        (if (bad) "\n\n── 诊断 ──\n" + miriDiagText(dev) else ""))
+                        (if (takeover) "\n（自检前已关掉本 App 在跑的驱动，让它独占设备）" else "") +
+                        (if (bad) "\n\n── 诊断 ──\n" + miriDiagText(dev) +
+                            "\n\n若还是 claim BUSY：接口被别的程序占着 —— 本 App 的另一个实例、\n" +
+                            "其它 SDR/电视 App 没退干净，或内核 DVB 驱动（msi2500/msi001）。\n" +
+                            "① 从最近任务里划掉本 App 再进；② 清掉其它 SDR App；③ 拔了重插再自检。"
+                         else ""))
                     .setPositiveButton("启动驱动") { _, _ -> rsp1Start(usb, dev) }
                     .setNegativeButton("关闭", null)
                     .show()
@@ -3311,8 +3336,12 @@ private const val FULL_STOP_DELAY_MS = 120000L
      * 自检按钮【保留】：RSP1 的取数方式、波段表对比、帧结构这些诊断还得靠它。
      * 只动"我们自己起的本机服务"这一种模式（bench=true 且 host=127.0.0.1），
      * 用户自己配的外部服务器（填了 IP 的台架模式）绝不碰。
+     *
+     * @param startNow true = 顺手把驱动也起起来（只在用户按了【开始接收】那条路用）。
+     *                 false = 只切 prefs，绝不起驱动；否则一打开 App 就占住设备，
+     *                 用户之后点【自检】会拿到 LIBUSB_ERROR_BUSY（真机就是这么被自己坑的）。
      */
-    private fun autoSelectDriver() {
+    private fun autoSelectDriver(startNow: Boolean = true) {
         val usb = getSystemService(Context.USB_SERVICE) as UsbManager
         val all = usb.deviceList.values.toList()
         val miri = all.firstOrNull { isMiriKnown(it) } ?: all.firstOrNull { it.vendorId == 0x1df7 }
@@ -3342,6 +3371,9 @@ private const val FULL_STOP_DELAY_MS = 120000L
             prefs.edit().putBoolean("bench", true)
                 .putString("host", "127.0.0.1")
                 .putString("tuner", "OTHER").apply()
+            // 只切配置（进界面/回前台）：到此为止 —— 不起驱动、不申请授权、不改增益、不弹提示，
+            // 免得每次回到 App 都被"检测到 RSP1 类设备"刷屏。
+            if (!startNow) return
             // RSP1 是 0~102 dB，界面存的 19.7 那种值对它偏低（收音机会很小声）——
             // 太低就给个合理起点，并明确告诉用户（不偷偷改）。
             val g = prefs.getFloat("gain", 19.7f)
