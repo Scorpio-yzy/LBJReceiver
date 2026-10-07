@@ -89,6 +89,13 @@ typedef struct {
     /* 字节直方图：最常见字节的占比能看出"是不是常量/空数据" */
     long hist[256];
     long hist_n;
+    int  hex_n;
+    char hex[3 * 32 + 1];
+    /* 活动度：|样本| 的峰值与均值。前端真正接进来时噪声底就有好几个 LSB，
+     * 波段表选错（前端开关没接通）则几乎全是 0 —— 这是"哪套波段表对"最直接的判据。 */
+    long abs_sum;
+    long abs_n;
+    int  peak_abs;
 } miri_stream_probe_t;
 
 /* 一次"真收数据"测试的结果，直接拿去拼自检报告 */
@@ -102,6 +109,14 @@ typedef struct {
     long cb_unaligned;
     int top_permille;         /* 最常见字节占比（千分比） */
     int sync_loss;            /* 504 帧解析丢帧计数 */
+    /* 诊断用：手机上没法看 logcat，把关键字节摆到屏幕上 */
+    int top_val[3];           /* 出现最多的前三个字节值 */
+    int top_share[3];         /* 对应的千分比 */
+    char hex_pay[3 * 32 + 1]; /* 载荷前 32 字节 */
+    char hex_hdr[3 * 16 + 1]; /* 帧头 16 字节 */
+    int hdr_valid;
+    int peak_abs;             /* |样本| 峰值（有符号域） */
+    int mean_abs_milli;       /* |样本| 均值 ×1000 */
 } miri_stream_result_t;
 
 /*
@@ -325,6 +340,19 @@ static void miri_stream_probe_cb(unsigned char *buf, uint32_t len, void *ctx)
         for (uint32_t i = 0; i < len && s->hist_n < 262144; i++, s->hist_n++)
             s->hist[buf[i]]++;
     }
+    if (s->hex_n < 32) {
+        for (uint32_t i = 0; i < len && s->hex_n < 32; i++, s->hex_n++) {
+            snprintf(s->hex + s->hex_n * 3, 4, "%02x ", buf[i]);
+        }
+    }
+    if (s->abs_n < 262144) {
+        for (uint32_t i = 0; i < len && s->abs_n < 262144; i++, s->abs_n++) {
+            int v = (int) (int8_t) buf[i];
+            if (v < 0) v = -v;
+            s->abs_sum += v;
+            if (v > s->peak_abs) s->peak_abs = v;
+        }
+    }
 
     double el = (double) (now.tv_sec - s->t_first.tv_sec)
                 + (double) (now.tv_usec - s->t_first.tv_usec) / 1e6;
@@ -372,13 +400,37 @@ static void miri_stream_test(mirisdr_dev_t *dev, const char *mode, int ms,
     if (s.dc_n > 0)
         out->dc_mean = (int) (s.dc_sum / s.dc_n);
     if (s.hist_n > 0) {
-        long top = 0;
-        for (int i = 0; i < 256; i++)
-            if (s.hist[i] > top)
-                top = s.hist[i];
-        out->top_permille = (int) (top * 1000 / s.hist_n);
+        for (int k = 0; k < 3; k++) {
+            int best = -1;
+            long bestv = -1;
+            for (int v = 0; v < 256; v++) {
+                int already = 0;
+                for (int j = 0; j < k; j++)
+                    if (out->top_val[j] == v) already = 1;
+                if (already) continue;
+                if (s.hist[v] > bestv) { bestv = s.hist[v]; best = v; }
+            }
+            out->top_val[k] = best;
+            out->top_share[k] = (best >= 0) ? (int) (bestv * 1000 / s.hist_n) : 0;
+        }
+        out->top_permille = out->top_share[0];
     }
+    out->peak_abs = s.peak_abs;
+    out->mean_abs_milli = (s.abs_n > 0) ? (int) (s.abs_sum * 1000 / s.abs_n) : 0;
+    memcpy(out->hex_pay, s.hex, sizeof(out->hex_pay));
+    out->hex_pay[sizeof(out->hex_pay) - 1] = 0;
     out->sync_loss = mirisdr_get_sync_loss(dev);
+    {
+        unsigned char hdr[16];
+        out->hdr_valid = mirisdr_get_last_frame_header(dev, hdr);
+        if (out->hdr_valid) {
+            for (int i = 0; i < 16; i++)
+                snprintf(out->hex_hdr + i * 3, 4, "%02x ", hdr[i]);
+            out->hex_hdr[3 * 16] = 0;
+        } else {
+            out->hex_hdr[0] = 0;
+        }
+    }
 
     if (r == 0 && s.bytes > 0) {
         double sec = (double) (s.t_last.tv_sec - s.t_first.tv_sec)
@@ -390,6 +442,8 @@ static void miri_stream_test(mirisdr_dev_t *dev, const char *mode, int ms,
 
 /* 自检时试出来的、能出数据的方式。openAsync 用它，省得再试一遍。 */
 static char g_preferred_mode[8] = "ISOC";
+/* 自检时比出来"前端接得进来"的那套波段表（0 = SDRplay，1 = 通用；-1 = 还没比过） */
+static int g_hw_pick = -1;
 
 static void miri_closed_cb(sdrtcp_t *tcp, void *ctx)
 {
@@ -508,7 +562,7 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jint
         jstring devicePath_, jstring tracePath_, jint hwFlavour)
 {
     (void) thiz;
-    char msg[1024];
+    char msg[2048];
     int n;
     mirisdr_dev_t *dev = NULL;
     const char *devicePath = devicePath_ ? (*env)->GetStringUTFChars(env, devicePath_, 0) : NULL;
@@ -617,31 +671,89 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jint
     }
     MIRI_LOGI("取数方式选定：%s", g_preferred_mode);
 
-    /* 一行一块，尽量短，能一屏看完 */
-    n += snprintf(msg + n, sizeof(msg) - n, "\n真收一段数据（应约 1.92 MS/s）：\n");
+    /*
+     * ---------- 两套前端波段表比一比 ----------
+     *
+     * libmirisdr 里 SDRplay 三兄弟和通用 MSi2500 板的前端开关/滤波寄存器是两套值
+     * （soft.c 的 hw_switch_freq_plan_sdrplay / _default）。选错的那套会把前端通路
+     * 断掉 —— 现象是"USB 上有数据、但 ADC 几乎什么都收不到"（载荷里绝大多数字节是 0）。
+     *
+     * 判据用【|样本| 峰值】：前端真接通时，光噪声底就有好几个 LSB；
+     * 断开时基本全程是 0。自检两台都真收一次，谁峰值高用谁，并把结论记下来给 openAsync 用。
+     */
+    miri_stream_result_t fl[2];
+    const int flav[2] = { MIRISDR_HW_SDRPLAY, MIRISDR_HW_DEFAULT };
+    const char *flav_names[2] = { "SDRplay", "通用 MSi2500" };
+
+    for (int i = 0; i < 2; i++) {
+        mirisdr_set_hw_flavour(dev, (mirisdr_hw_flavour_t) flav[i]);
+        mirisdr_set_sample_rate(dev, (uint32_t) hw_rate);
+        mirisdr_set_center_freq(dev, 821237500u);
+        mirisdr_set_tuner_gain(dev, 45);
+        miri_stream_test(dev, g_preferred_mode, 700, &fl[i]);
+        miri_trace(tracePath, "14 波段表 %s：速率=%.0f 峰值=%d 平均|x|=%d‰ 最常见=%d‰ 丢帧=%d 字节=%ld",
+                   flav_names[i], fl[i].rate, fl[i].peak_abs, fl[i].mean_abs_milli,
+                   fl[i].top_permille, fl[i].sync_loss, fl[i].bytes);
+    }
+    {
+        /* 哪套波段表"看得见东西"就用哪套。
+         * 要有 1.5 倍以上的差距才敢改判 —— 峰值本身有噪声，差不多的时侯按 USB PID 判就行。 */
+        int pick;
+        if (fl[1].peak_abs > fl[0].peak_abs * 3 / 2)
+            pick = 1;                                   /* 通用板明显更好 */
+        else if (fl[0].peak_abs > fl[1].peak_abs * 3 / 2)
+            pick = 0;                                   /* SDRplay 明显更好 */
+        else
+            pick = (hw == MIRISDR_HW_SDRPLAY) ? 0 : 1;  /* 差不多，按 PID */
+        g_hw_pick = pick;
+        mirisdr_set_hw_flavour(dev, (mirisdr_hw_flavour_t) flav[pick]);
+        MIRI_LOGI("波段表选定：%s（峰值 %d vs %d）", flav_names[pick], fl[pick].peak_abs,
+                  fl[1 - pick].peak_abs);
+    }
+
+    /* 写寄存器返回码：0 = 控制传输正常。上游把这些返回值全丢了，
+     * 所以"自检全成功"并不等于设备真的在听我们说话。 */
+    int ct = mirisdr_test_control_transfer(dev);
+    int cs = mirisdr_test_streaming_start(dev);
+    miri_trace(tracePath, "13 控制传输：写寄存器 %d，开始串流 %d", ct, cs);
+
+    n += snprintf(msg + n, sizeof(msg) - n,
+                  "\n控制传输：写寄存器 %d，开始串流 %d（0 = 正常，负数 = 设备没在听）\n", ct, cs);
+    n += snprintf(msg + n, sizeof(msg) - n, "真收一段数据（应约 1.92 MS/s）：\n");
+
     const char *names[2] = {"ISOC", "BULK"};
     const miri_stream_result_t *rs[2] = {&res_iso, &res_bulk};
+    const miri_stream_result_t *pick = NULL;
     for (int k = 0; k < 2; k++) {
         const miri_stream_result_t *x = rs[k];
         if (x->rate < 0)
-            continue;                                    /* 这次没试（BULK 已经好了） */
+            continue;                                    /* 这次没试 */
         if (x->rate > 0) {
             n += snprintf(msg + n, sizeof(msg) - n,
-                          "  %s：%.2f MS/s，块 %ld 个（%u~%u 字节，非 1024 倍数 %ld 个），"
-                          "丢帧 %d，直流均值 %d，最常见字节 %d‰\n",
+                          "  %s：%.2f MS/s，块 %ld 个（%u~%u 字节），丢帧 %d，直流均值 %d\n",
                           names[k], x->rate / 1e6, x->cb_count, x->cb_min, x->cb_max,
-                          x->cb_unaligned, x->sync_loss, x->dc_mean, x->top_permille);
+                          x->sync_loss, x->dc_mean);
+            if (pick == NULL) pick = x;
         } else if (x->started == 0) {
             n += snprintf(msg + n, sizeof(msg) - n, "  %s：起流了但一个字节都没收到\n", names[k]);
         } else {
             n += snprintf(msg + n, sizeof(msg) - n, "  %s：起流失败（%d）\n", names[k], x->started);
         }
     }
-    if (res_iso.rate > 0) {
+    n += snprintf(msg + n, sizeof(msg) - n,
+                  "  波段表对比（峰值越大=前端越接得进来）：SDRplay 峰值 %d，通用 峰值 %d\n",
+                  fl[0].peak_abs, fl[1].peak_abs);
+    n += snprintf(msg + n, sizeof(msg) - n, "  选用的波段表：%s\n", flav_names[g_hw_pick]);
+
+    if (pick != NULL) {
         n += snprintf(msg + n, sizeof(msg) - n,
-                      "  采用的取数方式：ISOC（驱动会把每批包拼连续、再按 1024 帧重组）\n");
-    } else if (res_bulk.rate > 0) {
-        n += snprintf(msg + n, sizeof(msg) - n, "  采用的取数方式：BULK（整块传输）\n");
+                      "  字节分布：%02x 占 %d‰，%02x 占 %d‰，%02x 占 %d‰\n",
+                      pick->top_val[0], pick->top_share[0],
+                      pick->top_val[1], pick->top_share[1],
+                      pick->top_val[2], pick->top_share[2]);
+        if (pick->hdr_valid)
+            n += snprintf(msg + n, sizeof(msg) - n, "  帧头 16 字节：%s\n", pick->hex_hdr);
+        n += snprintf(msg + n, sizeof(msg) - n, "  载荷前 32 字节：%s\n", pick->hex_pay);
     } else {
         n += snprintf(msg + n, sizeof(msg) - n,
                       "  两种取数方式都没收到数据 —— 把这一屏发我\n");
@@ -699,8 +811,11 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_openAsync(
      * USB 总线（还需要设备在它那张表里），纯为打一行日志不值得 —— 换成直接打波段表。 */
     MIRI_LOGI("设备已打开（前端波段表 %s）", hwFlavour == 1 ? "SDRplay" : "通用 MSi2500");
 
+    /* 波段表：自检如果比出哪套好就用哪套，否则按 USB PID 判定 */
+    int use_flav = (g_hw_pick >= 0) ? g_hw_pick : (hwFlavour == 1 ? 1 : 0);
     mirisdr_set_hw_flavour(dev, (mirisdr_hw_flavour_t)
-            (hwFlavour == 1 ? MIRISDR_HW_SDRPLAY : MIRISDR_HW_DEFAULT));
+            (use_flav == 1 ? MIRISDR_HW_SDRPLAY : MIRISDR_HW_DEFAULT));
+    MIRI_LOGI("前端波段表：%s（自检结论 %d）", use_flav == 1 ? "SDRplay" : "通用 MSi2500", g_hw_pick);
     mirisdr_set_sample_format(dev, "504_S8");
 
     /* 客户端速率 -> 硬件速率：硬件给不出 960k（下限 1.3 MSps），要 960k×2 再抽回一半 */

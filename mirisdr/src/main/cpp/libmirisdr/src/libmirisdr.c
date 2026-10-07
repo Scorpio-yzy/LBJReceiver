@@ -374,6 +374,38 @@ int mirisdr_get_sync_loss (mirisdr_dev_t *p) {
     return p->sync_loss_cnt;
 }
 
+/*
+ * ★ 本项目新增：把 504 帧头的 16 个字节抄出来（自检里十六进制显示）。
+ * 手机上没法看 logcat，帧结构对不对只能靠把这 16 个字节摆到屏幕上。
+ * 返回 1 表示已经抓到过一帧。
+ */
+int mirisdr_get_last_frame_header (mirisdr_dev_t *p, unsigned char *out16) {
+    if (!p || !out16 || !p->dbg_header_valid) return 0;
+    memcpy(out16, p->dbg_header, 16);
+    return 1;
+}
+
+/*
+ * ★ 本项目新增：做一次"写寄存器"的控制传输，把返回码原样带出来。
+ * 上游所有寄存器写的返回值都被丢掉了（mirisdr_write_reg 的结果没人检查），
+ * 所以"自检全成功"并不能证明设备真的在听我们说话 —— 这个返回码才能。
+ * 这里写的是 504_S8 的格式寄存器（本来就该是这个值），不会破坏状态。
+ */
+int mirisdr_test_control_transfer (mirisdr_dev_t *p) {
+    if (!p || !p->dh) return -1000;
+    return mirisdr_write_reg(p, 0x07, 0x000c94);
+}
+
+/*
+ * ★ 本项目新增：单独发一次"开始串流"命令（0x43）并把返回码带出来。
+ * streaming.c 里这个返回值也是被丢掉的 —— 如果它失败了，主机这边照样收得到 USB 帧，
+ * 但设备里的 ADC 可能根本没启动，帧内容就是一片静默（现象：有数据、没有信号）。
+ */
+int mirisdr_test_streaming_start (mirisdr_dev_t *p) {
+    if (!p || !p->dh) return -1000;
+    return libusb_control_transfer(p->dh, 0x42, 0x43, 0x0, 0x0, NULL, 0, CTRL_TIMEOUT);
+}
+
 int mirisdr_set_hw_flavour (mirisdr_dev_t *p, mirisdr_hw_flavour_t hw_flavour) {
     if (!p) goto failed;
 

@@ -70,6 +70,11 @@ static int mirisdr_samples_convert_504_s8 (mirisdr_dev_t *p, unsigned char* src,
                 p->frame_expected_known = 1;
             }
 
+            if (!p->dbg_header_valid) {
+                memcpy(p->dbg_header, p->frame_buf, 16);
+                p->dbg_header_valid = 1;
+            }
+
             memcpy(dst + ret, p->frame_buf + 16, 1008);
             ret += 1008;
             p->frame_expected += 504;

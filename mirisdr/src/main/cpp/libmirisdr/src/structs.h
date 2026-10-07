@@ -114,6 +114,9 @@ struct mirisdr_dev {
     int                 frame_lost;
     unsigned char       *iso_gather;
     int                 iso_gather_size;
+    /* 自检用：抓一帧的 16 字节帧头，便于在手机上直接看清帧结构（没有 adb） */
+    unsigned char       dbg_header[16];
+    int                 dbg_header_valid;
 
     /* dc offset calibration */
     enum {
