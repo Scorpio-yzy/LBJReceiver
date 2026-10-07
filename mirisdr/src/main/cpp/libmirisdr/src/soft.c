@@ -638,6 +638,18 @@ int mirisdr_set_transfer(mirisdr_dev_t *p, const char *v)
         goto failed;
     }
 
+    /* ★ 本项目新增：每次换取数方式（= 自检里开始一轮新的"真收一段数据"）都把
+     * 504 解析的状态和诊断量清零。否则：
+     *   · dbg_header 只取"这辈子第一帧"（dbg_header_valid 置上就再不复位），
+     *     自检打印的"帧头 16 字节"其实是好几轮之前那一帧，跟同屏的字节分布对不上；
+     *   · sync_loss_cnt 是累计的，报告里那行"丢帧"会越试越大；
+     *   · 上一轮剩下的半帧会让这一轮一开始就按错位置解析（白白记一堆丢帧）。 */
+    p->sync_loss_cnt = 0;
+    p->frame_lost = 0;
+    p->dbg_header_valid = 0;
+    p->frame_have = 0;
+    p->frame_expected_known = 0;
+
     return 0;
 
     failed: return -1;

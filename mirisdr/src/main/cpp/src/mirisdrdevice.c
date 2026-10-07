@@ -95,6 +95,7 @@ typedef struct {
      * 波段表选错（前端开关没接通）则几乎全是 0 —— 这是"哪套波段表对"最直接的判据。 */
     long abs_sum;
     long abs_n;
+    long act_n;               /* |x| > 8 的样本数：区分"真噪声/信号"和"常量空数据" */
     int  peak_abs;
 } miri_stream_probe_t;
 
@@ -117,6 +118,7 @@ typedef struct {
     int hdr_valid;
     int peak_abs;             /* |样本| 峰值（有符号域） */
     int mean_abs_milli;       /* |样本| 均值 ×1000 */
+    int active_permille;      /* |样本| > 8 的占比（千分比）：前端到底给没给数据 */
 } miri_stream_result_t;
 
 /*
@@ -308,6 +310,20 @@ static void *miri_stream_watchdog(void *arg)
     return NULL;
 }
 
+/*
+ * 报告是拼在一段定长缓冲里的，写法是 n += snprintf(msg + n, miri_left(n, sizeof(msg)), ...)。
+ * snprintf 返回的是"本该写多少"，被截断时 n 会一步冲到容量之外 —— 此时 miri_left(n, sizeof(msg))
+ * 会回绕成一个巨大的 size_t，下一次 snprintf 直接写到缓冲外面（栈溢出）。
+ * 用户手里没有 adb，这种崩溃只能靠"自检没跑完"的落盘记录发现，代价太高。
+ * 用这个助手把剩余长度夹到 [0, cap]：容量用完后 snprintf 收到 0 = 只算长度不写字。
+ */
+static int miri_left(int n, size_t cap)
+{
+    if (n < 0 || (size_t) n >= cap)
+        return 0;
+    return (int) (cap - (size_t) n);
+}
+
 static void miri_stream_probe_cb(unsigned char *buf, uint32_t len, void *ctx)
 {
     miri_stream_probe_t *s = (miri_stream_probe_t *) ctx;
@@ -350,6 +366,7 @@ static void miri_stream_probe_cb(unsigned char *buf, uint32_t len, void *ctx)
             int v = (int) (int8_t) buf[i];
             if (v < 0) v = -v;
             s->abs_sum += v;
+            if (v > 8) s->act_n++;
             if (v > s->peak_abs) s->peak_abs = v;
         }
     }
@@ -417,6 +434,7 @@ static void miri_stream_test(mirisdr_dev_t *dev, const char *mode, int ms,
     }
     out->peak_abs = s.peak_abs;
     out->mean_abs_milli = (s.abs_n > 0) ? (int) (s.abs_sum * 1000 / s.abs_n) : 0;
+    out->active_permille = (s.abs_n > 0) ? (int) (s.act_n * 1000 / s.abs_n) : 0;
     memcpy(out->hex_pay, s.hex, sizeof(out->hex_pay));
     out->hex_pay[sizeof(out->hex_pay) - 1] = 0;
     out->sync_loss = mirisdr_get_sync_loss(dev);
@@ -565,7 +583,7 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jlon
     /* 这个 handle 是 App 那个长期存在的设备对象 —— sdrtcp 的"客户端来不及取就丢"计数
      * 就记在它身上，正好借自检把"手机处理不过来"这个数带出来。 */
     miri_device_t *dh = as_dev(pointer);
-    char msg[2048];
+    char msg[8192];
     int n;
     mirisdr_dev_t *dev = NULL;
     const char *devicePath = devicePath_ ? (*env)->GetStringUTFChars(env, devicePath_, 0) : NULL;
@@ -600,13 +618,13 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jlon
 
     n = snprintf(msg, sizeof(msg), "已打开设备 ✓\n");
     r = mirisdr_set_hw_flavour(dev, (mirisdr_hw_flavour_t) hw);
-    n += snprintf(msg + n, sizeof(msg) - n, "前端波段表设为 %s：%s（%d）\n",
+    n += snprintf(msg + n, miri_left(n, sizeof(msg)), "前端波段表设为 %s：%s（%d）\n",
                   hw == MIRISDR_HW_SDRPLAY ? "SDRplay" : "通用 MSi2500",
                   r == 0 ? "成功" : "失败", r);
     miri_trace(tracePath, "3 波段表已设：%s", hw == MIRISDR_HW_SDRPLAY ? "SDRplay" : "通用 MSi2500");
 
     r = mirisdr_set_sample_format(dev, "504_S8");
-    n += snprintf(msg + n, sizeof(msg) - n, "8 位 IQ 采样格式：%s（%d）\n", r == 0 ? "成功" : "失败", r);
+    n += snprintf(msg + n, miri_left(n, sizeof(msg)), "8 位 IQ 采样格式：%s（%d）\n", r == 0 ? "成功" : "失败", r);
     miri_trace(tracePath, "4 采样格式已设");
 
     /* MSi2500 硬件下限 1.3 MSps：要 960k 会被 libmirisdr 悄悄夹到 1.3M。
@@ -614,7 +632,7 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jlon
     int decim = 1;
     int hw_rate = miri_plan_rate(MIRI_DEFAULT_RATE, &decim);
     r = mirisdr_set_sample_rate(dev, (uint32_t) hw_rate);
-    n += snprintf(msg + n, sizeof(msg) - n,
+    n += snprintf(msg + n, miri_left(n, sizeof(msg)),
                   "硬件采样率 %d S/s（= 960k × %d）：%s（%d），回读 %u\n",
                   hw_rate, decim, r == 0 ? "成功" : "失败", r, (unsigned) mirisdr_get_sample_rate(dev));
     miri_trace(tracePath, "5 硬件采样率 %d 已设，回读 %u（客户端 960k = ÷%d）",
@@ -625,7 +643,7 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jlon
      * 前端通不通 —— 这是"只能靠截图"时最有价值的一个数。 */
     uint32_t probe_freq = (freqHz > 0) ? (uint32_t) freqHz : 821237500u;
     r = mirisdr_set_center_freq(dev, probe_freq);
-    n += snprintf(msg + n, sizeof(msg) - n, "设 %.4f MHz：%s（%d），回读 %u\n",
+    n += snprintf(msg + n, miri_left(n, sizeof(msg)), "设 %.4f MHz：%s（%d），回读 %u\n",
                   probe_freq / 1e6, r == 0 ? "成功" : "失败", r,
                   (unsigned) mirisdr_get_center_freq(dev));
     miri_trace(tracePath, "6 频率 %u 已设，回读 %u", probe_freq,
@@ -636,12 +654,12 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jlon
     int ng = miri_get_gains(dev, gains, MIRI_GAINS_MAX);
     miri_trace(tracePath, "8 增益档位 %d 个", ng);
     if (ng > 0) {
-        n += snprintf(msg + n, sizeof(msg) - n, "增益档位 %d 个：", ng);
+        n += snprintf(msg + n, miri_left(n, sizeof(msg)), "增益档位 %d 个：", ng);
         for (int i = 0; i < ng && i < 12 && n < (int) sizeof(msg) - 16; i++)
-            n += snprintf(msg + n, sizeof(msg) - n, "%d ", gains[i]);
-        n += snprintf(msg + n, sizeof(msg) - n, "…（单位 0.1dB）\n");
+            n += snprintf(msg + n, miri_left(n, sizeof(msg)), "%d ", gains[i]);
+        n += snprintf(msg + n, miri_left(n, sizeof(msg)), "…（单位 0.1dB）\n");
     } else {
-        n += snprintf(msg + n, sizeof(msg) - n, "读增益档位失败（%d）\n", ng);
+        n += snprintf(msg + n, miri_left(n, sizeof(msg)), "读增益档位失败（%d）\n", ng);
     }
 
     /*
@@ -758,12 +776,14 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jlon
     int drops = (dh != NULL) ? (int) dh->tcp.dropped : -1;
     miri_trace(tracePath, "13 控制传输：写寄存器 %d，开始串流 %d；驱动丢块 %d", ct, cs, drops);
 
-    n += snprintf(msg + n, sizeof(msg) - n,
+    n += snprintf(msg + n, miri_left(n, sizeof(msg)),
                   "\n控制传输：写寄存器 %d，开始串流 %d（0 = 正常，负数 = 设备没在听）\n", ct, cs);
-    n += snprintf(msg + n, sizeof(msg) - n, "带宽对比（增益都用 90 dB）：8MHz 峰值 %d / 1.5MHz 峰值 %d\n",
-                  bw_wide.peak_abs, bw_narrow.peak_abs);
-    n += snprintf(msg + n, sizeof(msg) - n, "运行期间手机来不及取、驱动丢掉的块数：%d\n", drops);
-    n += snprintf(msg + n, sizeof(msg) - n, "真收一段数据（应约 1.92 MS/s）：\n");
+    n += snprintf(msg + n, miri_left(n, sizeof(msg)),
+                  "带宽对比（增益都用 90 dB）：8MHz 峰值 %d 平均|x| %d / 1.5MHz 峰值 %d 平均|x| %d\n",
+                  bw_wide.peak_abs, bw_wide.mean_abs_milli,
+                  bw_narrow.peak_abs, bw_narrow.mean_abs_milli);
+    n += snprintf(msg + n, miri_left(n, sizeof(msg)), "运行期间手机来不及取、驱动丢掉的块数：%d\n", drops);
+    n += snprintf(msg + n, miri_left(n, sizeof(msg)), "真收一段数据（应约 1.92 MS/s）：\n");
 
     const char *names[2] = {"ISOC", "BULK"};
     const miri_stream_result_t *rs[2] = {&res_iso, &res_bulk};
@@ -773,39 +793,62 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jlon
         if (x->rate < 0)
             continue;                                    /* 这次没试 */
         if (x->rate > 0) {
-            n += snprintf(msg + n, sizeof(msg) - n,
-                          "  %s：%.2f MS/s，块 %ld 个（%u~%u 字节），丢帧 %d，直流均值 %d\n",
+            n += snprintf(msg + n, miri_left(n, sizeof(msg)),
+                          "  %s：%.2f MS/s，块 %ld 个（%u~%u 字节），非 1024 倍数 %ld 个，丢帧 %d，直流均值 %d\n",
                           names[k], x->rate / 1e6, x->cb_count, x->cb_min, x->cb_max,
-                          x->sync_loss, x->dc_mean);
+                          x->cb_unaligned, x->sync_loss, x->dc_mean);
             if (pick == NULL) pick = x;
         } else if (x->started == 0) {
-            n += snprintf(msg + n, sizeof(msg) - n, "  %s：起流了但一个字节都没收到\n", names[k]);
+            n += snprintf(msg + n, miri_left(n, sizeof(msg)), "  %s：起流了但一个字节都没收到\n", names[k]);
         } else {
-            n += snprintf(msg + n, sizeof(msg) - n, "  %s：起流失败（%d）\n", names[k], x->started);
+            n += snprintf(msg + n, miri_left(n, sizeof(msg)), "  %s：起流失败（%d）\n", names[k], x->started);
         }
     }
-    n += snprintf(msg + n, sizeof(msg) - n,
-                  "  波段表对比（峰值越大=前端越接得进来）：SDRplay 峰值 %d，通用 峰值 %d\n",
-                  fl[0].peak_abs, fl[1].peak_abs);
-    n += snprintf(msg + n, sizeof(msg) - n, "  选用的波段表：%s\n", flav_names[g_hw_pick]);
 
-    if (pick != NULL) {
-        n += snprintf(msg + n, sizeof(msg) - n,
-                      "  字节分布：%02x 占 %d‰，%02x 占 %d‰，%02x 占 %d‰\n",
-                      pick->top_val[0], pick->top_share[0],
-                      pick->top_val[1], pick->top_share[1],
-                      pick->top_val[2], pick->top_share[2]);
-        if (pick->hdr_valid)
-            n += snprintf(msg + n, sizeof(msg) - n, "  帧头 16 字节：%s\n", pick->hex_hdr);
-        n += snprintf(msg + n, sizeof(msg) - n, "  载荷前 32 字节：%s\n", pick->hex_pay);
-    } else {
-        n += snprintf(msg + n, sizeof(msg) - n,
-                      "  两种取数方式都没收到数据 —— 把这一屏发我\n");
+    /* ★ 波段表这几行必须带上"平均|x| 和 活性"，不能只看峰值：峰值只是单个样本的最大值，
+     *   直流偏移或偶发尖峰都能把它顶上去。真机（1DF7:2500）就报过"通用 峰值 94"，
+     *   而同屏的字节分布显示 94% 的字节挤在 02~04 —— 那是直流偏移，不是信号。 */
+    n += snprintf(msg + n, miri_left(n, sizeof(msg)),
+                  "两套前端波段表各收 0.7 秒（增益 90 dB）：\n");
+    for (int i = 0; i < 2; i++) {
+        if (fl[i].rate > 0)
+            n += snprintf(msg + n, miri_left(n, sizeof(msg)),
+                          "  %s：峰值 %d，平均|x| %d，活性 %d‰，最常见字节 %02x 占 %d‰\n",
+                          flav_names[i], fl[i].peak_abs, fl[i].mean_abs_milli,
+                          fl[i].active_permille, fl[i].top_val[0], fl[i].top_share[0]);
+        else
+            n += snprintf(msg + n, miri_left(n, sizeof(msg)),
+                          "  %s：一个字节都没收到（起流 %d）\n", flav_names[i], fl[i].started);
     }
+    n += snprintf(msg + n, miri_left(n, sizeof(msg)), "  选用的波段表：%s\n", flav_names[g_hw_pick]);
+
+    /* 字节分布/载荷/帧头一律取自【选用】的那套。上一版取自"第一个出数据的取数方式"，
+     * 而那次用的是另一个波段表，于是屏幕上出现"选用通用 MSi2500"下面却摆着 SDRplay
+     * 那套的死数据 —— 自相矛盾，白跑一轮远程测试。 */
+    {
+        const miri_stream_result_t *c = &fl[g_hw_pick];
+        if (c->rate > 0) {
+            n += snprintf(msg + n, miri_left(n, sizeof(msg)),
+                          "  以下数据来自【选用】的那套 ——\n"
+                          "  字节分布：%02x 占 %d‰，%02x 占 %d‰，%02x 占 %d‰\n",
+                          c->top_val[0], c->top_share[0], c->top_val[1], c->top_share[1],
+                          c->top_val[2], c->top_share[2]);
+            if (c->hdr_valid)
+                n += snprintf(msg + n, miri_left(n, sizeof(msg)), "  帧头 16 字节：%s\n", c->hex_hdr);
+            n += snprintf(msg + n, miri_left(n, sizeof(msg)), "  载荷前 32 字节：%s\n", c->hex_pay);
+            n += snprintf(msg + n, miri_left(n, sizeof(msg)), "  前端判定：%s\n",
+                          (c->active_permille >= 50)
+                              ? "前端在给数据（活性正常）"
+                              : "【活性极低】样本几乎是常量，前端通路没接通或调谐器没工作 —— 把这一屏发我");
+        }
+    }
+    if (pick == NULL)
+        n += snprintf(msg + n, miri_left(n, sizeof(msg)),
+                      "  两种取数方式都没收到数据 —— 把这一屏发我\n");
 
     miri_trace(tracePath, "13 关闭设备…");
     mirisdr_close(dev);
-    n += snprintf(msg + n, sizeof(msg) - n, "设备已正常关闭。");
+    n += snprintf(msg + n, miri_left(n, sizeof(msg)), "设备已正常关闭。");
     miri_trace(tracePath, "自检结束（全程没有崩溃）");
     MIRI_LOGI("probe 结果:\n%s", msg);
     if (tracePath != NULL) (*env)->ReleaseStringUTFChars(env, tracePath_, tracePath);
