@@ -770,8 +770,14 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jlon
         const int alive_permille = 50;
         int a_want = fl[1].active_permille, a_now = fl[0].active_permille;
         int pick;
-        if (a_want < alive_permille && a_now < alive_permille)
-            pick = (hw == MIRISDR_HW_SDRPLAY) ? 0 : 1;  /* 没台，不下结论 */
+        int no_signal = (a_want < alive_permille && a_now < alive_permille);
+        if (no_signal)
+            /* 这个频率上没台：两套表都测不出活性，不能据此改判 ——
+             * 保留【上次】的结论（没有才按 USB PID 猜）。
+             * ★ 别在这里写死"按 PID 猜"：那会用 PID 默认值把用户上次在真有台的频点上
+             *   比出来的好结论冲掉。真机现象就是"自检跑了一轮之后反而一点声音都没有了"，
+             *   而且用户只会看到"自检全成功"。 */
+            pick = (g_hw_pick >= 0) ? g_hw_pick : ((hw == MIRISDR_HW_SDRPLAY) ? 0 : 1);
         else if (a_want > a_now * 3 / 2)
             pick = 1;                                   /* 通用板明显更好 */
         else if (a_now > a_want * 3 / 2)
@@ -869,6 +875,10 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jlon
                           "  %s：一个字节都没收到（起流 %d）\n", flav_names[i], fl[i].started);
     }
     n += snprintf(msg + n, miri_left(n, sizeof(msg)), "  选用的波段表：%s\n", flav_names[g_hw_pick]);
+    if (fl[0].active_permille < 50 && fl[1].active_permille < 50)
+        n += snprintf(msg + n, miri_left(n, sizeof(msg)),
+                      "  （这个频率上没台，两套都测不出活性 —— 波段表沿用上次的结论，\n"
+                      "    想重新比就在【本地有台的频点】上再自检一次；也可以在设置里手动指定）\n");
 
     /* 字节分布/载荷/帧头一律取自【选用】的那套。上一版取自"第一个出数据的取数方式"，
      * 而那次用的是另一个波段表，于是屏幕上出现"选用通用 MSi2500"下面却摆着 SDRplay

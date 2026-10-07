@@ -657,6 +657,8 @@ private const val FULL_STOP_DELAY_MS = 120000L
     @Volatile private var miriStartAt = 0L
     private var autoRetried = false
     private var miriTraceChecked = false
+    // 自检前的"会中断接收"确认只问一次（确认后递归调用自己，用完立刻清）
+    private var miriProbeConfirmed = false
     private var tts: TextToSpeech? = null
     private var ttsOk = false
     // 同一趟车不要反复念：LBJ 每隔几秒就重发一次，车次 -> 上次播报时刻
@@ -3271,6 +3273,26 @@ private const val FULL_STOP_DELAY_MS = 120000L
         //   claim_interface 失败 -6 (LIBUSB_ERROR_BUSY) —— 真机反馈就是这个：
         //   一打开 App 自动起了驱动，之后点自检就去开同一个设备，直接被自己挡住。
         val takeover = miriDriverUp || miriConn != null || miriDevice != null
+        // ★ 自检要独占设备，会把正在跑的驱动停掉 —— 正在听收音机的人会突然"没声音了"，
+        //   而收音机屏幕上【没有】开始接收那个按钮，用户自己没办法把驱动再拉起来。
+        //   所以先问一句，并说明后面要重新进收音机（自检完 App 会自己把驱动起回来）。
+        if (takeover && !miriProbeConfirmed) {
+            AlertDialog.Builder(this)
+                .setTitle("自检会中断正在接收的驱动")
+                .setMessage("自检要独占这根棒子：\n\n" +
+                    "· 现在正在跑的驱动会被临时停掉，收音机/预警接收会断；\n" +
+                    "· 自检跑完 App 会【自动把驱动重新起起来】；\n" +
+                    "· 但收音机要重新从主界面【收音机】按钮进一次（连接已断，不会自动重连）。\n\n" +
+                    "继续自检？")
+                .setPositiveButton("继续自检") { _, _ ->
+                    miriProbeConfirmed = true
+                    rsp1Probe(dev)
+                }
+                .setNegativeButton("取消", null)
+                .show()
+            return
+        }
+        miriProbeConfirmed = false
         toast("正在自检…（结果会弹出来）")
         Thread {
             if (takeover) {
@@ -3340,6 +3362,13 @@ private const val FULL_STOP_DELAY_MS = 120000L
                     .setPositiveButton("启动驱动") { _, _ -> rsp1Start(usb, dev) }
                     .setNegativeButton("关闭", null)
                     .show()
+                if (takeover) {
+                    // ★ 自检前是我们把驱动停掉的：这里自动起回来。否则用户回到收音机发现
+                    //   一点声音都没有，而收音机屏幕上【没有】开始接收那个按钮，
+                    //   他自己没办法把驱动再拉起来 —— 真机上就是这样"突然没声音了"。
+                    rsp1Start(usb, dev, quiet = true)
+                    toast("驱动已自动重新启动；收音机请重新进一次")
+                }
             }
         }.start()
     }
@@ -3461,6 +3490,16 @@ private const val FULL_STOP_DELAY_MS = 120000L
         rsp1Action()
     }
 
+    /** 当前生效的前端波段表（给弹窗用；native 里的值才是真正生效的那个）。 */
+    private fun miriFlavLabel(): String {
+        val pick = try { miriDevice?.pickedHwFlavour() ?: -1 } catch (_: Throwable) { -1 }
+        return when (pick) {
+            0 -> "SDRplay（RSP1/RSP1A/RSP2）"
+            1 -> "通用 MSi2500 板"
+            else -> "按 USB 型号自动（还没跑过自检）"
+        }
+    }
+
     /** 自检步骤落盘文件（native 崩了之后全靠它）。 */
     private fun miriTraceFile(): File = File(filesDir, "miri_probe.log")
 
@@ -3545,8 +3584,10 @@ private const val FULL_STOP_DELAY_MS = 120000L
                     // 波段表会退回按 PID 猜，对 1DF7:2500 是收不到数据的那套），
                     // 再问它"用哪种取数方式" —— 这时 preferredMode() 返回的就是恢复后的值。
                     try {
+                        // 设置里手动指定的波段表优先；没指定才用自检存下来的结论
+                        val forcedFlav = prefs.getInt("miri_flav", -1)
                         miriDevice!!.setStartupChoice(
-                            prefs.getInt("miri_hw_pick", -1),
+                            if (forcedFlav >= 0) forcedFlav else prefs.getInt("miri_hw_pick", -1),
                             prefs.getString("miri_mode", "ISOC") ?: "ISOC")
                     } catch (_: Throwable) { }
                     // 取数方式用自检试出来的那个（ISOC / BULK 哪个能出数据）
@@ -3572,6 +3613,10 @@ private const val FULL_STOP_DELAY_MS = 120000L
                             .setMessage("驱动已在本机 127.0.0.1:1234 提供数据。\n\n" +
                                 "已顺手帮你设好：台架模式 ✓、服务器地址 127.0.0.1、" +
                                 "增益档位【其它/网络源】。\n\n" +
+                                // ★ 把实际生效的前端波段表报出来：远程测试只有截图，
+                                //   而"选错波段表"的现象正是"有数据但收不到东西/一点声音都没有"，
+                                //   用户不看到这一行就无从排查。
+                                "前端波段表：" + miriFlavLabel() + "\n\n" +
                                 "现在点【开始接收】即可。要换回 RTL 电视棒：" +
                                 "把设置里的【台架模式】取消勾选。")
                             .setPositiveButton("知道了", null)
@@ -3982,6 +4027,24 @@ private const val FULL_STOP_DELAY_MS = 120000L
         }
         box.addView(btnRsp)
 
+        // ★ 前端波段表手动覆盖。Mirics 的前端开关/滤波寄存器有两套
+        //   （SDRplay 三兄弟一套、通用 MSi2500 板一套），选错的那套会把前端通路
+        //   断掉 —— 现象是"USB 上一直有数据、但 ADC 几乎收不到东西"，
+        //   收音机里就是"一点声音都没有"，而且换制式、换增益都没用。
+        //   自检会在【当前频率】上把两套比一遍自动选，但那个频点上没台时比不出来；
+        //   远程测试（用户只有截图、拿不到 logcat）时留这个开关，可以强制成对的那套。
+        val flavNames = arrayOf("自动（用自检结论）", "通用 MSi2500 板", "SDRplay（RSP1/RSP1A/RSP2）")
+        val flavVals = intArrayOf(-1, 1, 0)
+        var flavIdx = flavVals.indexOf(prefs.getInt("miri_flav", -1)).coerceAtLeast(0)
+        val btnFlav = Button(this)
+        btnFlav.isAllCaps = false
+        btnFlav.text = "前端波段表：" + flavNames[flavIdx]
+        btnFlav.setOnClickListener {
+            flavIdx = (flavIdx + 1) % flavNames.size
+            btnFlav.text = "前端波段表：" + flavNames[flavIdx]
+        }
+        box.addView(btnFlav)
+
         val view = ScrollView(this)
         view.addView(box)
 
@@ -4069,6 +4132,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                     .putBoolean("builtin", cBuiltin.isChecked)
                     .putString("tuner", tunerVals[tunerIdx])
                     .putBoolean("fc0013", tunerVals[tunerIdx] == "FC0013")
+                    .putInt("miri_flav", flavVals[flavIdx])
                     .putString("host", host)
                     .putFloat("freq", freq!!).putFloat("gain", gain!!).putInt("ppm", ppm!!)
                     .putFloat("thr", thr!!).putFloat("hold", hold!!).putBoolean("afc", cAfc.isChecked)
