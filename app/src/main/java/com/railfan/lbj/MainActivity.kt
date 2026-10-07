@@ -1203,6 +1203,25 @@ private const val FULL_STOP_DELAY_MS = 120000L
     private fun squelchFromProgress(p: Int): Double = p * 0.4
     private fun progressFromSquelch(db: Double): Int = (db / 0.4).toInt().coerceIn(0, 100)
 
+    /**
+     * 把 PPM 校准值同时落到【三处】—— 少一处就会出现"设置里已经改了、主界面还显示旧值"：
+     *   ① prefs：下次启动用；
+     *   ② 收音机引擎：正在听的那条；
+     *   ③ 接近器引擎：主界面状态行那个 P: 就是它快照里的值，列车解码也用它。
+     * 两个引擎都写共享的 R._g2['ppm']（重连时用它重下发），但各自的 self.ppm 是分开的，
+     * 只通知其中一个，另一个的显示就会停在旧值上（真机反馈就是这么来的）。
+     */
+    private fun applyPpm(sug: Int) {
+        prefs.edit().putInt("ppm", sug).apply()
+        radioCall2("set_ppm", sug)
+        val eng = engine
+        if (eng != null) {
+            Thread {
+                try { eng.callAttr("set_ppm", sug) } catch (_: Throwable) { }
+            }.start()
+        }
+    }
+
     /** 后台安全调用收音机引擎的方法（绝不在主线程调 Python） */
     private fun radioCall2(name: String, arg: Any) {
         val re = radioEngine ?: return
@@ -2018,7 +2037,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
             return
         }
         val sug = c.optInt("ppm_suggest", 0)
-        prefs.edit().putInt("ppm", sug).apply()      // 引擎那边已经应用，这里落盘
+        applyPpm(sug)      // 收音机那边已经应用，这里落盘并把接近器引擎也同步过去
         AlertDialog.Builder(this)
             .setTitle("自动 PPM 校准完成")
             .setMessage(String.format(
@@ -2089,9 +2108,8 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 off, rssi, now, sug
             ))
             .setPositiveButton("应用") { _, _ ->
-                prefs.edit().putInt("ppm", sug).apply()
-                radioCall2("set_ppm", sug)
-                toast(String.format(Locale.US, "PPM 已设为 %d", sug))
+                applyPpm(sug)
+                toast(String.format(Locale.US, "PPM 已设为 %d（接近器也已同步）", sug))
             }
             .setNegativeButton("关闭", null)
             .show()
