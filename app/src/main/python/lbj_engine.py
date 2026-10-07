@@ -173,6 +173,30 @@ R.LBJRealtimeDecoder.send_local_intent = _noop_intent
 # 真机报文日志限流：每 20 秒最多打一条，别把 logcat 刷爆
 _geo_log_at = [0.0]
 
+def degmin_to_deg(s, ddigits):
+    """LBJ 报文里的经纬度是【度分】：经度 dddmm.mmmm（9 位）、纬度 ddmm.mmmm（8 位）。
+
+    ★ 这不是推断，是从真机报文反推验证过的：
+      京广线一趟 D29（公里标 0021.5）报出的字段是 '116088600' / '39441100'，
+      按度分解出来是 116.14767 / 39.73517 —— 而用户当时就在京广线旁边 10 米、
+      手机 GPS 是 116.14846 / 39.73599，两者只差 90 米，公里标也只差 0.9 公里。
+      按十进制度解则会得到 116.0886 / 39.4411，离用户 33 公里（就是"站在铁轨边
+      却说线路在 31.8 公里外"的由来）。
+
+    例子：'39441100' -> 39 + 44.1100/60 = 39.73517
+          '116088600'-> 116 + 8.8600/60 = 116.14767
+
+    分必须是 0~60，越界就当作解析不出来（宁可显示 --- 也不能给错坐标）。
+    """
+    if not s or not s.isdigit() or len(s) != ddigits + 6:
+        return None
+    deg = int(s[:ddigits])
+    m = float(s[ddigits:ddigits + 2] + '.' + s[ddigits + 2:])
+    if not (0.0 <= m < 60.0):
+        return None
+    return deg + m / 60.0
+
+
 _HEXMAP = {'*': 'A', 'U': 'B', ' ': 'C', '-': 'D', ')': 'E', '(': 'F'}
 _END_NAME = {'30': '无端', '31': 'A端', '32': 'B端'}
 
@@ -805,13 +829,19 @@ class LbjEngine:
                     self._rate_block = len(iq)
                     self._rate_dts = []
                     self._rate_last = time.time()
-                elif n <= 32:
+                elif n <= 80:
+                    # ★ 前 20 块（约 1.4 秒）【不采信】：Python 预热、GC、首次滤波/
+                    #   频谱初始化都压在这一段，块间隔明显偏长 —— 拿它量速率会得出
+                    #   "实测 597 kS/s（差 -38%）"这种误报（真机上就是这么暴露的）。
+                    #   引擎自己的进度日志是 200 块/13.68 秒 = 958 kS/s，源速率一直是对的。
+                    #   从第 20 块起取 61 个间隔，再用中位数（中位数不受零星卡顿影响）。
                     _now = time.time()
-                    self._rate_dts.append(_now - float(getattr(self, '_rate_last', _now)))
+                    if n >= 20:
+                        self._rate_dts.append(_now - float(getattr(self, '_rate_last', _now)))
                     self._rate_last = _now
-                    if n == 32:
+                    if n == 80:
                         _d = sorted(self._rate_dts)
-                        _med = _d[len(_d) // 2]
+                        _med = _d[len(_d) // 2] if _d else 0.0
                         rate, warn = self.check_rate(getattr(self, '_rate_block', 0), _med)
                         self.measured_rate = rate
                         self.rate_warn = warn
@@ -1623,21 +1653,20 @@ class LbjEngine:
                 new['end_raw'] = ep
         except Exception:
             pass
-        # 经纬度：按 README 的约定是 lon=dddffffff(9位) / lat=ddffffff(8位)，
-        # 也就是"十进制度放大 1e6"（例：'116378600' -> 116.3786）。
-        #
-        # ★ 曾经怀疑过是"度分"格式并改过一次，后来用 6 趟真实报文验证：
-        #   按十进制度解出来是武汉 114.305/30.6、沈阳 123.43/41.805、郑州 113.665/34.747，
-        #   全都能对上；按度分解则有一半的"分"超过 60 直接非法。所以原样保留十进制度。
-        #   解析结果仍要过一遍地理范围校验：宁可显示"---"，也不能把错坐标当真给用户看。
+        # 经纬度：经度 9 位 dddmm.mmmm、纬度 8 位 ddmm.mmmm —— 【度分】格式，
+        # 不是十进制度。判据见 degmin_to_deg 的说明（真机报文 D29 与用户 GPS 只差 90 米）。
+        # 解析结果仍要过一遍地理范围校验：宁可显示"---"，也不能把错坐标当真给用户看。
         # 经纬度是成对出现的，两个都合理才采用；只对一个也当作不可信整对丢弃。
         vlon = vlat = None
         try:
             a = buf[30:39]
             b = buf[39:47]
             if a.isdigit() and b.isdigit():
-                tlon = float(a[:3] + '.' + a[3:])
-                tlat = float(b[:2] + '.' + b[2:])
+                tlon = degmin_to_deg(a, 3)
+                tlat = degmin_to_deg(b, 2)
+                if tlon is None or tlat is None:
+                    new['geo_bad'] = a + ',' + b
+                    raise ValueError('度分格式不合法')
                 # 范围取中国铁路的实际包络再留余量：经度 73.5~135.1E(喀什~抚远)，
                 # 纬度 18.2~53.6N(三亚~漠河)。格式里没有符号位，南半球的值本来也无法编码，
                 # 所以收紧下界能多拦掉一批解析错的垃圾数据。
@@ -1839,7 +1868,7 @@ class LbjEngine:
           （因为全局被留成了 keywords=['99999'] + filter_mode='strict'）。
           所以这里先快照全局，结束后原样恢复；同时暂停在线采集，避免读到半污染状态。
         """
-        from lbj_synth import synth_lbj_basic, synth_batch
+        from lbj_synth import synth_lbj_basic, synth_batch, degmin_str
 
         global _SELFTEST_ACTIVE, _SELFTEST_STARTED_AT, _SELFTEST_WARNED
         saved_g0 = dict(R._g0)
@@ -1871,7 +1900,8 @@ class LbjEngine:
             _ext_kw = dict(train='12345', speed_kmh=45, km='0123.4',
                            prefix_bytes=b'\x20G', loco_code='310', loco_no='0201',
                            route='京沪线', func=1, end_pos='31',
-                           lon='116378600', lat='39865300',
+                           # 经纬度是【度分】格式，用 degmin_str 编（见它的说明）
+                           lon=degmin_str(116.3786, 3), lat=degmin_str(39.8653, 2),
                            sample_rate=R.RTL_SAMPLE_RATE, deviation=4500.0,
                            offset_hz=R.DEFAULT_DC_OFFSET_HZ, noise=0.03, amp=0.5)
             iq_ext = np.concatenate([synth_batch(tail_bits=0, **_ext_kw),
