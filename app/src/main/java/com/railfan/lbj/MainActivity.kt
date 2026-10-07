@@ -3231,10 +3231,10 @@ private const val FULL_STOP_DELAY_MS = 120000L
         toast("正在自检…（结果会弹出来）")
         Thread {
             if (takeover) {
-                // close() 会 mirisdr_close → libusb_release_interface + libusb_close，
-                // 内核随之放掉这个接口；之后必须换一个全新的 MiriSdrDevice（句柄已失效）。
-                try { miriDevice?.close(miriDevice!!.handle()) } catch (_: Throwable) { }
-                miriDevice = null
+                // releaseUsb → mirisdr_close → libusb_release_interface + libusb_close，
+                // 内核随之放掉接口；句柄保留（native 结构不能 free：sdrtcp 的 worker
+                // 线程还在用它），所以这里【不】把 miriDevice 置空。
+                try { miriDevice?.releaseUsb(miriDevice!!.handle()) } catch (_: Throwable) { }
                 try { miriConn?.close() } catch (_: Throwable) { }
                 miriConn = null
                 miriDriverUp = false

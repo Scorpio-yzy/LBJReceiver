@@ -984,6 +984,44 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_stop(JNIEnv *env, jobject thiz, jlong
     sdrtcp_stop_serving_client(&d->tcp);
 }
 
+/* 放开 USB 与监听端口，但【保留】这个句柄，之后还能再 openAsync 复用。
+ *
+ * 为什么不用 close()：close() 会把 d 整个 free 掉，而 sdrtcp 的 worker 线程
+ * (tcp_server / commandListener) 还拿着 d（cleanup 之后还要调 closedcb(obj, ctx)），
+ * 另外 sdrtcp_stop_serving_client() 在"已经在服务"时只是置 STAGE_NEEDS_STOPPING，
+ * 真正收尾是异步的 —— 这时候 free 就是 use-after-free。
+ * 自检只要把【接口】让出来（mirisdr_close -> libusb_release_interface + libusb_close）
+ * 就够了，句柄留着最省事也最安全。 */
+JNIEXPORT void JNICALL
+Java_com_railfan_lbj_mirisdr_MiriSdrDevice_releaseUsb(JNIEnv *env, jobject thiz, jlong pointer)
+{
+    (void) env;
+    (void) thiz;
+    miri_device_t *d = as_dev(pointer);
+    if (d == NULL)
+        return;
+    if (d->dev != NULL) {
+        mirisdr_cancel_async(d->dev);
+        mirisdr_close(d->dev);          /* 内核接口在这里被放掉 */
+        pthread_mutex_lock(&d->lock);
+        d->dev = NULL;
+        d->streaming = 0;
+        d->carry_n = 0;
+        pthread_mutex_unlock(&d->lock);
+    }
+    /* 监听端口也一起收掉：不收的话自检完再点【启动驱动】会绑不上 1234。
+     * 这一步在"正在服务"时是异步收尾，所以下面绝不能紧接着 free(d)。 */
+    sdrtcp_stop_serving_client(&d->tcp);
+    /* 等监听 socket 真的关掉（最多 1.2 秒）。不等的话用户紧接着点【启动驱动】，
+     * sdrtcp_open_socket 会撞上"还在收尾"的状态直接失败（= 又冒出一句"驱动没起来"）。
+     * 这里只等待、不释放任何东西，worker 线程还在跑也安全。 */
+    for (int i = 0; i < 120 && d->tcp.listen_socket != -1; i++)
+        usleep(10 * 1000);
+    MIRI_LOGI("已释放 USB 与监听端口（句柄保留，可再 openAsync）");
+}
+
+/* 彻底销毁（App 退出进程前才该用）。注意：正在服务时 sdrtcp 的 worker 线程
+ * 仍持有 d，别在流还没停干净时调它 —— 自检/换设备请用上面的 releaseUsb()。 */
 JNIEXPORT void JNICALL
 Java_com_railfan_lbj_mirisdr_MiriSdrDevice_close(JNIEnv *env, jobject thiz, jlong pointer)
 {

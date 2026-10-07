@@ -68,6 +68,15 @@ public class MiriSdrDevice {
     /** 停流（保留设备句柄）。 */
     public native void stop(long handle);
 
+    /**
+     * 放开 USB 接口与监听端口，但**保留句柄**，之后还能再 openAsync 复用。
+     *
+     * 自检要独占设备时用它：正在跑的驱动会 claim 住接口，此时去开同一个设备
+     * 必然拿到 LIBUSB_ERROR_BUSY；而 close() 会把 native 结构整个 free 掉，
+     * sdrtcp 的 worker 线程还在用它（use-after-free），所以不能用 close()。
+     */
+    public native void releaseUsb(long handle);
+
     /** 关设备、释放句柄。 */
     public native void close(long handle);
 
