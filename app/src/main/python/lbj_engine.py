@@ -170,8 +170,12 @@ def _noop_intent(self, *args, **kwargs):
 R.LBJRealtimeDecoder.send_local_intent = _noop_intent
 
 
+# 真机报文日志限流：每 20 秒最多打一条，别把 logcat 刷爆
+_geo_log_at = [0.0]
+
 _HEXMAP = {'*': 'A', 'U': 'B', ' ': 'C', '-': 'D', ')': 'E', '(': 'F'}
 _END_NAME = {'30': '无端', '31': 'A端', '32': 'B端'}
+
 
 # 到达状态里代表"正在接近"的取值（来自 lbj_ref._A0）
 _APPROACH_STATES = ('接近', '即将到达')
@@ -200,6 +204,22 @@ def _train_digits(s):
 def _train_key(s):
     """车次比较用的规范形式：去掉空白、转大写。"""
     return re.sub(r'\s+', '', str(s or '')).upper()
+
+
+def _train_richer(old, new):
+    """old 是否比 new 【更完整】（用于合并车次名）。
+
+    基础帧只有数字（'15'），扩展帧才带字母前缀（'D15'）—— 两者是同一趟车。
+    LBJ 是周期性重发的，扩展帧之后还会不断收到基础帧，所以合并时
+    【不能让短名冲掉长名】，否则界面上刚显示出来的 'D15' 会被后面的 '15' 覆盖回去，
+    用户看到的就是"最近列车一直显示 15，不更新成 D15"（真机反馈）。
+    """
+    o = str(old or '').strip()
+    n = str(new or '').strip()
+    if not o or not n or o == n:
+        return False
+    # old 带字母（扩展帧）、new 是纯数字（基础帧），且数字部分相同 -> old 更完整
+    return (not o.isdigit()) and n.isdigit() and (_train_digits(o) == _train_digits(n))
 
 
 def _same_train(a, b):
@@ -777,14 +797,22 @@ class LbjEngine:
             # 量出来再和 960 kS/s 比：不是的话(比如 RSP1 的固定抽取档位)频率会整体偏，
             # 必须明确告诉用户，而不是让他去猜为什么收不到车。
             try:
+                # ★ 用【块间隔的中位数】算速率，不用"总量 ÷ 总时间"：
+                #   驱动那边的发送缓冲在客户端暂停/切换时会把积压攒起来，客户端一恢复
+                #   就成串地涌过来 —— 用总时间算会把速率算高（真机上量到过 1221 kS/s，
+                #   弹出"不是 960 kS/s"的误报），而中位数不受这一小段爆发影响。
                 if n == 1:
-                    self._rate_n = len(iq)
-                    self._rate_t0 = time.time()
-                elif n <= 12:
-                    self._rate_n = int(getattr(self, '_rate_n', 0)) + len(iq)
-                    if n == 12:
-                        el = time.time() - float(getattr(self, '_rate_t0', time.time()))
-                        rate, warn = self.check_rate(self._rate_n, el)
+                    self._rate_block = len(iq)
+                    self._rate_dts = []
+                    self._rate_last = time.time()
+                elif n <= 32:
+                    _now = time.time()
+                    self._rate_dts.append(_now - float(getattr(self, '_rate_last', _now)))
+                    self._rate_last = _now
+                    if n == 32:
+                        _d = sorted(self._rate_dts)
+                        _med = _d[len(_d) // 2]
+                        rate, warn = self.check_rate(getattr(self, '_rate_block', 0), _med)
                         self.measured_rate = rate
                         self.rate_warn = warn
                         print('LBJ: ' + (warn if warn else
@@ -912,6 +940,15 @@ class LbjEngine:
         # ---- 列车接收历史：一趟车一条，记起止时间/起止公里标/经纬度等 ----
         # 端位与经纬度在 self.extra 里（decode_lbj 先跑，_capture_extra 已经更新过它）。
         ex = self.extra or {}
+        # ---- 远程排查：把带经纬度的扩展帧【原文】打一行（限流 20 秒）----
+        # 经纬度字段的位置/格式都是推断出来的，只有真机原文能定死。
+        if ex.get('raw') and (ex.get('lon') is not None or ex.get('geo_bad')):
+            _t = time.time()
+            if _t - _geo_log_at[0] >= 20.0:
+                _geo_log_at[0] = _t
+                print('LBJ-GEO train=%s km=%s lon=%s lat=%s bad=%s raw=%s' % (
+                    train, rec['position'], ex.get('lon'), ex.get('lat'),
+                    ex.get('geo_bad') or '-', ex.get('raw')), flush=True)
         try:
             self.triplog.on_train({
                 'train': train,
@@ -952,6 +989,12 @@ class LbjEngine:
                 if str(v) in ('', '----', '---', '---.-', '未知'):
                     continue
                 merged[k] = v
+            # ★ 车次名"就长不就短"：扩展帧的 'D15' 不能被后面基础帧的 '15' 覆盖
+            #   （LBJ 周期性重发，基础帧来得更频繁）。tkey/tpure 跟着最终名字走。
+            if _train_richer(old.get('train'), rec.get('train')):
+                merged['train'] = old.get('train')
+            merged['tkey'] = _train_digits(merged.get('train')) or merged.get('train')
+            merged['tpure'] = str(merged.get('train')).isdigit()
             merged['time'] = rec['time']
             merged['ts'] = rec['ts']
             self._trains.pop(idx)
@@ -1115,13 +1158,20 @@ class LbjEngine:
                 for nm, d in per_line_d.items():
                     if near_d is None or d < near_d:
                         near_d, near_name = d, nm
-                reason = '离你最近的是【%s】，约 %.1f 公里 —— 超出了判定范围。' % (near_name, (near_d or 0) / 1000.0)
+                arr = snap.get(near_name) or []
+                ks = sorted(a[0] for a in arr) if arr else []
+                reason = '离你最近的是【%s】，约 %.1f 公里 —— 超出了判定范围。' % (
+                    near_name, (near_d or 0) / 1000.0)
                 reason += chr(10) + chr(10)
-                reason += ('判定要求手机位置离线路在 5 公里以内：'
-                           '本功能靠列车报出的公里标+经纬度来反推你的位置，'
-                           '离得太远就无法确定你在这条线的哪一段。')
+                if ks:
+                    reason += ('这条线采集到的样本：公里标 %.1f ~ %.1f，共 %d 个。'
+                               % (ks[0], ks[-1], len(arr)))
+                    reason += chr(10)
+                reason += ('判定要求手机位置离线路在 5 公里以内：本功能靠列车报出的'
+                           '公里标 + 经纬度反推你的位置，所以【必须收到从你身边经过的列车】。')
                 reason += chr(10) + chr(10)
-                reason += '请走到铁路附近（或站在能看到线路的地方）再试。'
+                reason += ('如果你就站在铁路边上，那说明收到的列车都离你太远 —— '
+                           '等一趟从跟前经过的车（信号最强的那趟）再试一次。')
             return json.dumps({
                 'ok': False,
                 'reason': reason,
@@ -1573,9 +1623,13 @@ class LbjEngine:
                 new['end_raw'] = ep
         except Exception:
             pass
-        # 经纬度：按 README 的约定是 lon=dddffffff(9位) / lat=ddffffff(8位)。
-        # 但注意：这个字段在参考实现真正跑起来的代码里从未被使用，格式属于"推断"，
-        # 所以必须做范围校验——宁可显示"---"，也不能把解析错的坐标当真给用户看。
+        # 经纬度：按 README 的约定是 lon=dddffffff(9位) / lat=ddffffff(8位)，
+        # 也就是"十进制度放大 1e6"（例：'116378600' -> 116.3786）。
+        #
+        # ★ 曾经怀疑过是"度分"格式并改过一次，后来用 6 趟真实报文验证：
+        #   按十进制度解出来是武汉 114.305/30.6、沈阳 123.43/41.805、郑州 113.665/34.747，
+        #   全都能对上；按度分解则有一半的"分"超过 60 直接非法。所以原样保留十进制度。
+        #   解析结果仍要过一遍地理范围校验：宁可显示"---"，也不能把错坐标当真给用户看。
         # 经纬度是成对出现的，两个都合理才采用；只对一个也当作不可信整对丢弃。
         vlon = vlat = None
         try:
@@ -1594,6 +1648,9 @@ class LbjEngine:
                     new['geo_bad'] = '%.4f,%.4f' % (tlon, tlat)
         except Exception:
             pass
+        # 原始 50 字符扩展帧也留一份：远程排查经纬度字段布局时，只有它说了算
+        # （手机上没法看文件，靠这串原文 + logcat 就能定死格式与偏移）。
+        new['raw'] = buf
         # 显式赋值（含 None），保证上一帧的旧坐标不会残留
         new['lon'] = vlon
         new['lat'] = vlat
