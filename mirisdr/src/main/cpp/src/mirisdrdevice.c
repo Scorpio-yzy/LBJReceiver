@@ -97,6 +97,14 @@ typedef struct {
     long abs_n;
     long act_n;               /* |x| > 8 的样本数：区分"真噪声/信号"和"常量空数据" */
     int  peak_abs;
+    /* ★ 两种极性口径各算一遍。504_S8 名义上是"有符号"，但真机上见过直接给
+     * "以 128 为中心的无符号"的板子（1DF7:2500）：那时按有符号算就会把正常信号
+     * 报成"轨到轨饱和"（实测 平均|x| 118/128、峰值 128，而最常见字节 79/89/86
+     * 其实都紧贴 0x80）。最后按均值挑一套口径，与串流路径 miri_read_cb 一致。 */
+    long abs_sum_u;
+    long act_n_u;
+    int  peak_abs_u;
+    long seen;                /* 已经流过的字节数：用来跳过开头那段没稳定下来的数据 */
 } miri_stream_probe_t;
 
 /* 一次"真收数据"测试的结果，直接拿去拼自检报告 */
@@ -116,9 +124,10 @@ typedef struct {
     char hex_pay[3 * 32 + 1]; /* 载荷前 32 字节 */
     char hex_hdr[3 * 16 + 1]; /* 帧头 16 字节 */
     int hdr_valid;
-    int peak_abs;             /* |样本| 峰值（有符号域） */
-    int mean_abs_milli;       /* |样本| 均值 ×1000 */
+    int peak_abs;             /* |样本| 峰值（按下面的口径归一化后） */
+    int mean_abs_milli;       /* |样本| 均值 ×1000（同上） */
     int active_permille;      /* |样本| > 8 的占比（千分比）：前端到底给没给数据 */
+    int centered_unsigned;    /* 1 = 设备给的就是以 128 为中心的无符号；0 = 有符号（串流时 +128） */
 } miri_stream_result_t;
 
 /*
@@ -356,11 +365,14 @@ static void miri_stream_probe_cb(unsigned char *buf, uint32_t len, void *ctx)
         for (uint32_t i = 0; i < len && s->hist_n < 262144; i++, s->hist_n++)
             s->hist[buf[i]]++;
     }
-    if (s->hex_n < 32) {
+    /* 载荷取样要跳过开头：设备刚起流时前若干 KB 常是常量（实测全是 03/04），
+     * 拿它打十六进制会和同屏的"字节分布"自相矛盾（分布是全捕获的）。 */
+    if (s->seen >= 16384 && s->hex_n < 32) {
         for (uint32_t i = 0; i < len && s->hex_n < 32; i++, s->hex_n++) {
             snprintf(s->hex + s->hex_n * 3, 4, "%02x ", buf[i]);
         }
     }
+    s->seen += len;
     if (s->abs_n < 262144) {
         for (uint32_t i = 0; i < len && s->abs_n < 262144; i++, s->abs_n++) {
             int v = (int) (int8_t) buf[i];
@@ -368,6 +380,12 @@ static void miri_stream_probe_cb(unsigned char *buf, uint32_t len, void *ctx)
             s->abs_sum += v;
             if (v > 8) s->act_n++;
             if (v > s->peak_abs) s->peak_abs = v;
+
+            int u = (int) buf[i] - 128;      /* 无符号口径：128 是零点 */
+            if (u < 0) u = -u;
+            s->abs_sum_u += u;
+            if (u > 8) s->act_n_u++;
+            if (u > s->peak_abs_u) s->peak_abs_u = u;
         }
     }
 
@@ -416,6 +434,20 @@ static void miri_stream_test(mirisdr_dev_t *dev, const char *mode, int ms,
     out->cb_unaligned = s.cb_unaligned;
     if (s.dc_n > 0)
         out->dc_mean = (int) (s.dc_sum / s.dc_n);
+    /* 极性约定：与串流路径 miri_read_cb 用同一套判据 ——
+     * 原始字节均值 >= 64 说明设备本身给的就是"以 128 为中心"的无符号数据（不加 128）；
+     * 否则是有符号数据（串流时 +128 搬到 128 中心）。
+     * 自检的数字必须按同一口径算，否则一台好设备会被报成"轨到轨饱和"。 */
+    out->centered_unsigned = (s.dc_n > 0) && ((s.dc_sum / s.dc_n) >= 64);
+    if (out->centered_unsigned) {
+        out->mean_abs_milli = (s.abs_n > 0) ? (int) (s.abs_sum_u * 1000 / s.abs_n) : 0;
+        out->active_permille = (s.abs_n > 0) ? (int) (s.act_n_u * 1000 / s.abs_n) : 0;
+        out->peak_abs = s.peak_abs_u;
+    } else {
+        out->mean_abs_milli = (s.abs_n > 0) ? (int) (s.abs_sum * 1000 / s.abs_n) : 0;
+        out->active_permille = (s.abs_n > 0) ? (int) (s.act_n * 1000 / s.abs_n) : 0;
+        out->peak_abs = s.peak_abs;
+    }
     if (s.hist_n > 0) {
         for (int k = 0; k < 3; k++) {
             int best = -1;
@@ -432,9 +464,7 @@ static void miri_stream_test(mirisdr_dev_t *dev, const char *mode, int ms,
         }
         out->top_permille = out->top_share[0];
     }
-    out->peak_abs = s.peak_abs;
-    out->mean_abs_milli = (s.abs_n > 0) ? (int) (s.abs_sum * 1000 / s.abs_n) : 0;
-    out->active_permille = (s.abs_n > 0) ? (int) (s.act_n * 1000 / s.abs_n) : 0;
+
     memcpy(out->hex_pay, s.hex, sizeof(out->hex_pay));
     out->hex_pay[sizeof(out->hex_pay) - 1] = 0;
     out->sync_loss = mirisdr_get_sync_loss(dev);
@@ -815,6 +845,13 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jlon
             n += snprintf(msg + n, miri_left(n, sizeof(msg)), "  %s：起流失败（%d）\n", names[k], x->started);
         }
     }
+
+    if (pick != NULL)
+        n += snprintf(msg + n, miri_left(n, sizeof(msg)),
+                      "  极性口径：%s（下面 |x| 的 0 = 无信号，128 = 满幅）\n",
+                      pick->centered_unsigned
+                          ? "设备本身就以 128 为中心（无符号）"
+                          : "有符号，串流时 +128 归中");
 
     /* ★ 波段表这几行必须带上"平均|x| 和 活性"，不能只看峰值：峰值只是单个样本的最大值，
      *   直流偏移或偶发尖峰都能把它顶上去。真机（1DF7:2500）就报过"通用 峰值 94"，
