@@ -3245,7 +3245,10 @@ private const val FULL_STOP_DELAY_MS = 120000L
             try { trace.delete() } catch (_: Throwable) { }
             val res = try {
                 if (miriDevice == null) miriDevice = MiriSdrDevice()
-                miriDevice!!.probe(conn.fileDescriptor, name, trace.absolutePath, hw)
+                // 用界面上当前设的频率自检（把频率调到一个强台再自检，就能看前端通不通）
+                val probeHz = Math.round(prefs.getFloat("freq", FREQ_MHZ.toFloat()) * 1e6)
+                miriDevice!!.probe(miriDevice!!.handle(), conn.fileDescriptor, name,
+                    trace.absolutePath, hw, probeHz)
             } catch (t: Throwable) {
                 "自检异常：" + (t.message ?: t.toString())
             }

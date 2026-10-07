@@ -558,10 +558,13 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_initialize(JNIEnv *env, jobject thiz)
  * 这个文件把"崩在哪一步"带回来；正常跑完会写"自检结束"。
  */
 JNIEXPORT jstring JNICALL
-Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jint fd,
-        jstring devicePath_, jstring tracePath_, jint hwFlavour)
+Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jlong pointer,
+        jint fd, jstring devicePath_, jstring tracePath_, jint hwFlavour, jlong freqHz)
 {
     (void) thiz;
+    /* 这个 handle 是 App 那个长期存在的设备对象 —— sdrtcp 的"客户端来不及取就丢"计数
+     * 就记在它身上，正好借自检把"手机处理不过来"这个数带出来。 */
+    miri_device_t *dh = as_dev(pointer);
     char msg[2048];
     int n;
     mirisdr_dev_t *dev = NULL;
@@ -613,10 +616,16 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jint
     miri_trace(tracePath, "5 硬件采样率 %d 已设，回读 %u（客户端 960k = ÷%d）",
                hw_rate, (unsigned) mirisdr_get_sample_rate(dev), decim);
 
-    r = mirisdr_set_center_freq(dev, 821237500u);
-    n += snprintf(msg + n, sizeof(msg) - n, "设 821.2375 MHz：%s（%d），回读 %u\n",
-                  r == 0 ? "成功" : "失败", r, (unsigned) mirisdr_get_center_freq(dev));
-    miri_trace(tracePath, "6 频率已设，回读 %u", (unsigned) mirisdr_get_center_freq(dev));
+    /* 用【界面上当前设的频率】而不是写死 821.2375：
+     * 这样把频率调到一个本地强台（FM 广播常发）再点自检，就能靠"|样本| 峰值"看出
+     * 前端通不通 —— 这是"只能靠截图"时最有价值的一个数。 */
+    uint32_t probe_freq = (freqHz > 0) ? (uint32_t) freqHz : 821237500u;
+    r = mirisdr_set_center_freq(dev, probe_freq);
+    n += snprintf(msg + n, sizeof(msg) - n, "设 %.4f MHz：%s（%d），回读 %u\n",
+                  probe_freq / 1e6, r == 0 ? "成功" : "失败", r,
+                  (unsigned) mirisdr_get_center_freq(dev));
+    miri_trace(tracePath, "6 频率 %u 已设，回读 %u", probe_freq,
+               (unsigned) mirisdr_get_center_freq(dev));
 
     miri_trace(tracePath, "7 读增益档位…");
     int gains[MIRI_GAINS_MAX];
@@ -688,7 +697,7 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jint
     for (int i = 0; i < 2; i++) {
         mirisdr_set_hw_flavour(dev, (mirisdr_hw_flavour_t) flav[i]);
         mirisdr_set_sample_rate(dev, (uint32_t) hw_rate);
-        mirisdr_set_center_freq(dev, 821237500u);
+        mirisdr_set_center_freq(dev, probe_freq);
         /* 用 90 dB 来比：Mirics 的增益是"数值越大增益越高"，45 dB 时前端其实还没被推动，
          * 两套波段表的峰值会都贴在噪声底上（之前两台都报"峰值 4"就是这么来的）。 */
         mirisdr_set_tuner_gain(dev, 90);
@@ -713,14 +722,43 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jint
                   fl[1 - pick].peak_abs);
     }
 
+    /*
+     * ---------- 带宽对比（只报告，不自动改）----------
+     *
+     * Linux 内核 msi2500 的 set_usb_adc() 会把调谐器带宽设成采样率（bandwidth = f_adc），
+     * 而 libmirisdr 固定 8MHz。我们跑 1.92MSps + 8MHz，带外噪声偏多。
+     * 但"收窄更好"不能靠猜：带宽窄了噪声底低、|样本| 峰值也跟着低，单看峰值反而会选宽的。
+     * 所以这里只把两个带宽下的数摆出来，由人来判（有强信号时峰值由信号主导，噪声底差异
+     * 会自己显形）。
+     */
+    miri_stream_result_t bw_wide, bw_narrow;
+    /* 带宽枚举值：200K=0 300K=1 600K=2 1536K=3 5M=4 6M=5 7M=6 8M=7（见 libmirisdr 的 structs.h） */
+    mirisdr_set_bandwidth(dev, 7);
+    mirisdr_set_sample_rate(dev, (uint32_t) hw_rate);
+    mirisdr_set_center_freq(dev, probe_freq);
+    mirisdr_set_tuner_gain(dev, 90);
+    miri_stream_test(dev, g_preferred_mode, 600, &bw_wide);
+    mirisdr_set_bandwidth(dev, 3);
+    mirisdr_set_sample_rate(dev, (uint32_t) hw_rate);
+    mirisdr_set_center_freq(dev, probe_freq);
+    mirisdr_set_tuner_gain(dev, 90);
+    miri_stream_test(dev, g_preferred_mode, 600, &bw_narrow);
+    mirisdr_set_bandwidth(dev, 7);                    /* 恢复默认，不改用户行为 */
+    miri_trace(tracePath, "15 带宽对比：8MHz 峰值=%d 平均|x|=%d‰ / 1.5MHz 峰值=%d 平均|x|=%d‰",
+               bw_wide.peak_abs, bw_wide.mean_abs_milli, bw_narrow.peak_abs, bw_narrow.mean_abs_milli);
+
     /* 写寄存器返回码：0 = 控制传输正常。上游把这些返回值全丢了，
      * 所以"自检全成功"并不等于设备真的在听我们说话。 */
     int ct = mirisdr_test_control_transfer(dev);
     int cs = mirisdr_test_streaming_start(dev);
-    miri_trace(tracePath, "13 控制传输：写寄存器 %d，开始串流 %d", ct, cs);
+    int drops = (dh != NULL) ? (int) dh->tcp.dropped : -1;
+    miri_trace(tracePath, "13 控制传输：写寄存器 %d，开始串流 %d；驱动丢块 %d", ct, cs, drops);
 
     n += snprintf(msg + n, sizeof(msg) - n,
                   "\n控制传输：写寄存器 %d，开始串流 %d（0 = 正常，负数 = 设备没在听）\n", ct, cs);
+    n += snprintf(msg + n, sizeof(msg) - n, "带宽对比（增益都用 90 dB）：8MHz 峰值 %d / 1.5MHz 峰值 %d\n",
+                  bw_wide.peak_abs, bw_narrow.peak_abs);
+    n += snprintf(msg + n, sizeof(msg) - n, "运行期间手机来不及取、驱动丢掉的块数：%d\n", drops);
     n += snprintf(msg + n, sizeof(msg) - n, "真收一段数据（应约 1.92 MS/s）：\n");
 
     const char *names[2] = {"ISOC", "BULK"};

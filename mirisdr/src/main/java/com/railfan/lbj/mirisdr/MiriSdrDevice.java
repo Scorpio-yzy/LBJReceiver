@@ -33,8 +33,12 @@ public class MiriSdrDevice {
      * @param tracePath 自检步骤落盘文件（App 私有目录里的普通文件）。native 里如果崩了，
      *                  用户手里没有 logcat，只能靠这个文件带回"崩在哪一步"。
      *                  正常跑完会写一行"自检结束"。
+     * @param freqHz    用哪个频率自检。取界面上当前设的频率 —— 这样把频率调到一个本地强台
+     *                  （FM 广播常发）再自检，就能靠 |样本| 峰值看出前端通不通。
+     *                  传 0 则退回 821.2375 MHz。
      */
-    public native String probe(int fd, String devicePath, String tracePath, int hwFlavour);
+    public native String probe(long handle, int fd, String devicePath, String tracePath,
+                               int hwFlavour, long freqHz);
 
     /**
      * 打开设备并在 port 上起 rtl_tcp 服务（地址一般传 127.0.0.1）。
