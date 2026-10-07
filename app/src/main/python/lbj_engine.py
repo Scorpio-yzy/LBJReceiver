@@ -245,9 +245,13 @@ FC0013_GAINS = [-9.9, -7.3, -6.5, -6.3, -6.0, -5.8, -5.4,
                 17.9, 18.1, 18.2, 18.4, 18.6, 18.8, 19.1, 19.7]
 
 # "非 RTL"设备（RSP1/RSP2、Airspy 等，走网络 rtl_tcp 源）的增益：App 不知道它有哪些
-# 档位，所以用 0.5dB 一格、-20~60dB 的直通表 —— 填多少就原样下发给服务器，
-# 由服务器侧（SoapySDR / SDRplay API）去解释。
-_PASSTHROUGH_GAINS = [round(-20.0 + 0.5 * i, 1) for i in range(0, 161)]
+# 档位，所以用 0.5dB 一格、-20~102dB 的直通表 —— 填多少就原样下发给服务器，
+# 由服务器侧（SoapySDR / SDRplay API / 本机 Mirics 驱动）去解释。
+#
+# ★ 上限从 60 提到 102：RSP1/RSP2（Mirics）的增益范围本来就是 0~102dB，而且它的
+#   增益语义是"数值越大增益越高"。以前表到 60、界面校验又只到 50，用户根本推不上去，
+#   真机上的表现就是"能解码列车、但收音机声音很小"（有效增益一直很低）。
+_PASSTHROUGH_GAINS = [round(-20.0 + 0.5 * i, 1) for i in range(0, 245)]
 
 
 _SELFTEST_LOCK = threading.RLock()

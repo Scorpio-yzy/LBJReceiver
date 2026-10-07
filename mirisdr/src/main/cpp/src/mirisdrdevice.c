@@ -689,7 +689,9 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jint
         mirisdr_set_hw_flavour(dev, (mirisdr_hw_flavour_t) flav[i]);
         mirisdr_set_sample_rate(dev, (uint32_t) hw_rate);
         mirisdr_set_center_freq(dev, 821237500u);
-        mirisdr_set_tuner_gain(dev, 45);
+        /* 用 90 dB 来比：Mirics 的增益是"数值越大增益越高"，45 dB 时前端其实还没被推动，
+         * 两套波段表的峰值会都贴在噪声底上（之前两台都报"峰值 4"就是这么来的）。 */
+        mirisdr_set_tuner_gain(dev, 90);
         miri_stream_test(dev, g_preferred_mode, 700, &fl[i]);
         miri_trace(tracePath, "14 波段表 %s：速率=%.0f 峰值=%d 平均|x|=%d‰ 最常见=%d‰ 丢帧=%d 字节=%ld",
                    flav_names[i], fl[i].rate, fl[i].peak_abs, fl[i].mean_abs_milli,

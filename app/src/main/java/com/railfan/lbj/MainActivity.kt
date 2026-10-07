@@ -3630,7 +3630,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
         //   R820T：0.0 ~ 49.6 dB（29 档）
         //   FC0013：-9.9 ~ 19.7 dB（23 档，而且有【负增益】档）
         //   之前写"FC0013 最大 15.7"是错的 —— 15.7 只是参考实现的默认值，不是它的上限。
-        val eGain = numField(box, "增益 dB（R820T 0 ~ 49.6；FC0013 -9.9 ~ 19.7，含负档）",
+        val eGain = numField(box, "增益 dB（R820T 0 ~ 49.6；FC0013 -9.9 ~ 19.7；RSP1/RSP2 等网络源 0 ~ 102）",
             prefs.getFloat("gain", 19.7f).toString(), signed = true)
 
         // 这里曾经有个「自动增益（AGC）」开关，已删除。
@@ -3721,8 +3721,19 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 chk(eFreq, freq != null && freq >= 0.1f && freq <= 2000f, "请输入 0.1 ~ 2000")
 
                 val gain = eGain.text.toString().trim().toFloatOrNull()
-                // 允许负值：FC0013 有 -9.9 ~ -5.4 的负增益档（强信号时用它降互调）
-                chk(eGain, gain != null && gain >= -10f && gain <= 50f, "请输入 -10 ~ 50")
+                // 允许负值：FC0013 有 -9.9 ~ -5.4 的负增益档（强信号时用它降互调）。
+                // 「其它/网络源」给到 102 dB —— RSP1/RSP2 的增益范围就是 0~102，
+                // 以前写死 -10~50 会把它们一直压在很低的有效增益上
+                //（真机上表现为：能解码列车，但收音机声音很小）。
+                val gLo: Float
+                val gHi: Float
+                when (tunerVals[tunerIdx]) {
+                    "FC0013" -> { gLo = -10f; gHi = 20f }
+                    "OTHER" -> { gLo = -20f; gHi = 102f }
+                    else -> { gLo = 0f; gHi = 50f }
+                }
+                chk(eGain, gain != null && gain >= gLo && gain <= gHi,
+                    "请输入 %.0f ~ %.0f".format(gLo, gHi))
 
                 val ppm = ePpm.text.toString().trim().toIntOrNull()
                 chk(ePpm, ppm != null && ppm >= -100 && ppm <= 100, "请输入 -100 ~ 100 的整数")
