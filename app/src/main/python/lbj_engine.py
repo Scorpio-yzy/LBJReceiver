@@ -827,22 +827,28 @@ class LbjEngine:
                 #   弹出"不是 960 kS/s"的误报），而中位数不受这一小段爆发影响。
                 if n == 1:
                     self._rate_block = len(iq)
-                    self._rate_dts = []
-                    self._rate_last = time.time()
-                elif n <= 80:
-                    # ★ 前 20 块（约 1.4 秒）【不采信】：Python 预热、GC、首次滤波/
-                    #   频谱初始化都压在这一段，块间隔明显偏长 —— 拿它量速率会得出
-                    #   "实测 597 kS/s（差 -38%）"这种误报（真机上就是这么暴露的）。
-                    #   引擎自己的进度日志是 200 块/13.68 秒 = 958 kS/s，源速率一直是对的。
-                    #   从第 20 块起取 61 个间隔，再用中位数（中位数不受零星卡顿影响）。
-                    _now = time.time()
-                    if n >= 20:
-                        self._rate_dts.append(_now - float(getattr(self, '_rate_last', _now)))
-                    self._rate_last = _now
-                    if n == 80:
-                        _d = sorted(self._rate_dts)
-                        _med = _d[len(_d) // 2] if _d else 0.0
-                        rate, warn = self.check_rate(getattr(self, '_rate_block', 0), _med)
+                    self._rate_n = 0
+                    self._rate_t0 = None
+                elif n <= 140:
+                    # ★ 量速率的窗口必须【避开积压段】，而且不能用"间隔中位数"：
+                    #
+                    #   · 驱动一侧在客户端还没开始读的时候会把数据排在缓冲池里
+                    #     （池子 32 块 ≈ 2.2 秒），客户端一连上就成串涌来；
+                    #   · 起步那几秒还有 Python 预热、GC、首次滤波/频谱初始化；
+                    #   · 而"成串到达"会让间隔中位数严重偏小 —— 真机上量出过
+                    #     3478 kS/s（+262%）、597 kS/s（-38%）这些鬼数字，
+                    #     而同期引擎自己的进度日志一直是 200 块/13.68 秒 = 958 kS/s。
+                    #
+                    # 所以：从第 40 块（积压已经排完）起算，到第 140 块为止，
+                    # 用【总样点 ÷ 总时间】—— 长窗口下成串到达不影响总量。
+                    if n == 40:
+                        self._rate_t0 = time.time()
+                        self._rate_n = 0
+                    if n >= 40:
+                        self._rate_n = int(getattr(self, '_rate_n', 0)) + len(iq)
+                    if n == 140 and getattr(self, '_rate_t0', None):
+                        el = time.time() - float(self._rate_t0)
+                        rate, warn = self.check_rate(self._rate_n, el)
                         self.measured_rate = rate
                         self.rate_warn = warn
                         print('LBJ: ' + (warn if warn else
