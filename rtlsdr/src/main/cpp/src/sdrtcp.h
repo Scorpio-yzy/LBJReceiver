@@ -48,6 +48,8 @@ struct sdrtcp {
 
     volatile int client_socket;
     volatile int listen_socket;
+    /* ★ 本项目新增：客户端来不及取、被丢掉的块数（诊断用） */
+    volatile unsigned long dropped;
 };
 
 void sdrtcp_init(sdrtcp_t * obj);

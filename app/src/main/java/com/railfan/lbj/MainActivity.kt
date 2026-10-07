@@ -219,6 +219,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
     private var radioFreqHz = 457_000_000.0
     private var radioMode = "NFM"
     private var lastRssi = -140.0
+    private var lastRadioErr = ""          // 收音机错误（数据源卡住/解调失败…）只在变化时提示一次
     private var lastSquelchDb = 12.0       // 高于底噪多少 dB
     private var lastThreshold = -95.0      // 实际生效的门限（底噪 + 上面的值）
     private var lastFloor = -140.0
@@ -1506,7 +1507,15 @@ private const val FULL_STOP_DELAY_MS = 120000L
         lastFloor = o.optDouble("floor", lastFloor)
         lastSqlOn = o.optBoolean("squelch_on", lastSqlOn)
         setFreqText(radioFreqHz)
+        // 数据源卡住 / 解调出错时收音机线程会退出。以前界面上完全看不出来
+        //（还是显示"静噪中"，只是再也不动了），这里明确报出来。
+        val rerr = o.optString("err", "")
+        if (rerr != lastRadioErr) {
+            lastRadioErr = rerr
+            if (rerr.isNotEmpty()) toast("收音机：$rerr")
+        }
         val st = when {
+            rerr.isNotEmpty() -> "⚠ " + rerr
             !lastSqlOn -> "静噪已关"
             o.optBoolean("open", false) -> "有声"
             else -> "静噪中"

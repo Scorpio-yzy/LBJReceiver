@@ -31,7 +31,9 @@
 
 #define FEED_SLEEP_IF_NOT_READY_MILLIS (500)
 
-#define POOL_MAX_ELEMENTS (5)
+/* ★ 本项目改动：5 个缓冲太小（每个放一块 IQ，5 个约 8 毫秒），客户端打个嗝就见底。
+ * 改成 32 个留余量。 */
+#define POOL_MAX_ELEMENTS (32)
 
 #define STAGE_UNINITIALIZED (0)
 #define STAGE_INITIALIZED (1)
@@ -358,13 +360,23 @@ int sdrtcp_feed(sdrtcp_t * obj, unsigned char  * buf, uint32_t len) {
     if (obj->state == STAGE_CLIENT_SERVING) {
         pthread_mutex_lock(&obj->state_locker);
         if (obj->state == STAGE_CLIENT_SERVING) {
-            if ((buff = pool_get_wait_lock(&obj->workpool, 0, 1)) != NULL) {
+            /* ★ 本项目改动：这里【绝对不能等】。
+             * sdrtcp_feed() 是从 libusb 完成回调里调用的：用 block=1 等空缓冲的话，
+             * 客户端停顿十几毫秒就会把回调堵住 → USB 事件循环停摆 → 整条流永久死掉
+             * （真机现象：频谱卡住、App 还能点、但不再接收，且不会自愈）。
+             * 宁可丢这一块，也必须让回调立刻返回。 */
+            if ((buff = pool_get_wait_lock(&obj->workpool, 0, 0)) != NULL) {
                 extbuffer_preparetohandle(buff, len);
                 memcpy((void *) buff->ushortbuffer, (void *) buf,
                        sizeof(uint16_t) * len);
                 pool_get_unlock(&obj->workpool, 0, buff);
+                succesful = 1;
+            } else {
+                obj->dropped++;
+                if ((obj->dropped % 200) == 1)
+                    LOGI("SdrTcp: 客户端来不及取，已丢 %lu 块", obj->dropped);
+                succesful = 2;
             }
-            succesful = 1;
         } else if (obj->state == STAGE_SOCKET_OPEN || obj->state == STAGE_CLIENT_OPEN || obj->state == STAGE_CLIENT_OPEN_STARTED_ASYNC) {
             usleep(FEED_SLEEP_IF_NOT_READY_MILLIS * 1000);
             succesful = 2; // no client to send data to
@@ -383,6 +395,7 @@ void sdrtcp_init(sdrtcp_t * obj) {
     pthread_mutex_init(&obj->state_locker, NULL);
     obj->client_socket = -1;
     obj->listen_socket = -1;
+    obj->dropped = 0;
 }
 
 void sdrtcp_free(sdrtcp_t * obj) {

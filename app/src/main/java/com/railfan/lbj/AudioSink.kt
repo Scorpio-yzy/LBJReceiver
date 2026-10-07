@@ -19,9 +19,16 @@ import android.media.AudioTrack
  *
  * Python 侧算好 48kHz 单声道 int16 PCM 后调用 write()，这里直接送进 AudioTrack。
  *
- * ★ 用 MODE_STREAM + 阻塞式 write()：
- *   缓冲区写满时 write() 会阻塞，于是 Python 的 DSP 循环自然被压到实时速度，
- *   既不需要额外做节流，也不会因为跑得比数据源快而把队列抽干。
+ * ★ 用 MODE_STREAM + 【非阻塞】write()。
+ *
+ * 以前这里是阻塞写，本意是"让 DSP 循自然被压到实时速度"。但真机上踩到了大坑：
+ * 音频系统一旦抽风（焦点变化、路由切换、声道被别的 App 占住），阻塞写会一直卡着，
+ * 而调用它的正是 Python 的 DSP 线程 —— DSP 卡住就不再读数据源，socket 于是不再被取走，
+ * 驱动的发送缓冲很快填满，libusb 回调跟着被堵死，整条 USB 流永久停摆。
+ * 现象就是：手台贴近发射（静噪打开、开始出声）之后"频谱卡住、App 还能点、但不再接收"。
+ *
+ * 现在改成非阻塞写：缓冲区满就丢掉这一块。听起来最多顿一下，绝不会把整条链路拖死。
+ * （数据源本来就是实时的，DSP 不可能跑得比它快，所以不需要靠阻塞来节流。）
  */
 class AudioSink(private val ctx: Context) {
 
@@ -72,10 +79,17 @@ class AudioSink(private val ctx: Context) {
         return true
     }
 
+    /** 被丢掉的音频字节数（非阻塞写缓冲区满时累计，只用于诊断） */
+    @Volatile var droppedBytes: Long = 0
+        private set
+
     fun write(pcm: ByteArray) {
         val t = track ?: return
         try {
-            t.write(pcm, 0, pcm.size)
+            val n = t.write(pcm, 0, pcm.size, AudioTrack.WRITE_NON_BLOCKING)
+            if (n < pcm.size) {
+                droppedBytes += (pcm.size - maxOf(n, 0)).toLong()
+            }
         } catch (_: Throwable) {
         }
     }

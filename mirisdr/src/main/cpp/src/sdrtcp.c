@@ -31,7 +31,9 @@
 
 #define FEED_SLEEP_IF_NOT_READY_MILLIS (500)
 
-#define POOL_MAX_ELEMENTS (5)
+/* ★ 本项目改动：5 个缓冲太小了 —— 每个缓冲放一块 IQ（约 6KB），5 个也就 8 毫秒。
+ * 客户端只要打一个嗝（音频 write 卡住、App 被系统降频）就会见底。改成 32 个，留出余量。 */
+#define POOL_MAX_ELEMENTS (32)
 
 #define STAGE_UNINITIALIZED (0)
 #define STAGE_INITIALIZED (1)
@@ -358,13 +360,26 @@ int sdrtcp_feed(sdrtcp_t * obj, unsigned char  * buf, uint32_t len) {
     if (obj->state == STAGE_CLIENT_SERVING) {
         pthread_mutex_lock(&obj->state_locker);
         if (obj->state == STAGE_CLIENT_SERVING) {
-            if ((buff = pool_get_wait_lock(&obj->workpool, 0, 1)) != NULL) {
+            /* ★ 本项目改动：这里【绝对不能等】。
+             *
+             * sdrtcp_feed() 是从 libusb 的完成回调里调用的，用 block=1 等空缓冲的话，
+             * 客户端只要停顿十几毫秒，回调就原地阻塞 → USB 事件循环停摆 →
+             * 整条流永久死掉（真机现象：手台贴近发射后"频谱卡住、App 还能点、但不再接收"，
+             * 而且不会自愈，只能重开）。
+             *
+             * 宁可丢掉这一块（听起来就是一声轻微的咔），也必须让回调立刻返回。 */
+            if ((buff = pool_get_wait_lock(&obj->workpool, 0, 0)) != NULL) {
                 extbuffer_preparetohandle(buff, len);
                 memcpy((void *) buff->ushortbuffer, (void *) buf,
                        sizeof(uint16_t) * len);
                 pool_get_unlock(&obj->workpool, 0, buff);
+                succesful = 1;
+            } else {
+                obj->dropped++;
+                if ((obj->dropped % 200) == 1)
+                    LOGI("SdrTcp: 客户端来不及取，已丢 %lu 块", obj->dropped);
+                succesful = 2;   /* 2 = 没送出去（呼叫方本来就忽略返回值） */
             }
-            succesful = 1;
         } else if (obj->state == STAGE_SOCKET_OPEN || obj->state == STAGE_CLIENT_OPEN || obj->state == STAGE_CLIENT_OPEN_STARTED_ASYNC) {
             usleep(FEED_SLEEP_IF_NOT_READY_MILLIS * 1000);
             succesful = 2; // no client to send data to
@@ -383,6 +398,7 @@ void sdrtcp_init(sdrtcp_t * obj) {
     pthread_mutex_init(&obj->state_locker, NULL);
     obj->client_socket = -1;
     obj->listen_socket = -1;
+    obj->dropped = 0;
 }
 
 void sdrtcp_free(sdrtcp_t * obj) {

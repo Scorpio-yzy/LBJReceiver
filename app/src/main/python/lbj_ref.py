@@ -652,7 +652,12 @@ class _A2:
                     self._error = 'TCP连接断开'
                     return
                 hdr += buf
-            self._sock.settimeout(None)
+            # ★ 保持一个超时，不能设成 None：
+            #   数据源一旦卡住（驱动 USB 事件循环停摆、连接半死），read() 会永远阻塞，
+            #   界面看着还是"接收中"，其实早就没数据了，而且永远不会自愈。
+            #   留 8 秒（驱动正常时每 1~2 毫秒就有一块，8 秒只可能是真卡住；
+            #   留足余量是为了别在"驱动刚起来还没推数据"的那几秒误判）。
+            self._sock.settimeout(8.0)
             self._send_cmd(CMD_SET_SAMPLERATE, self.sample_rate)
             self._send_cmd(CMD_SET_FREQ, int(self.freq_hz))
             self._send_cmd(CMD_SET_GAINMODE, 1)
@@ -661,7 +666,13 @@ class _A2:
             self._send_cmd(CMD_SET_AGC, 0)
             stream = self._sock.makefile('rb')
             while self._running:
-                data = stream.read(chunk_bytes)
+                try:
+                    data = stream.read(chunk_bytes)
+                except (socket.timeout, TimeoutError):
+                    if self._running:
+                        self._error = '数据源超过 8 秒没数据（驱动卡住或连接已死）'
+                        print('LBJ-ERR rtl_tcp 读取超时', flush=True)
+                    break
                 if not data:
                     if self._running:
                         self._error = 'rtl_tcp 服务端已断开'
