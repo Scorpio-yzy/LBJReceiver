@@ -39,6 +39,22 @@
 - 该模块里的 `libusb/` 沿用 `:rtlsdr` 模块自带的那份 Android 移植（LGPL-2.1）
 - `libmirisdr/src/libusb.h` + `libusb_compat.c` 是本项目新增的兼容层（把上游要的
   libusb 1.0.22 接口映射到移植版已有的 fd 接口上），同样是 GPL-3.0-or-later
+- 本项目对 libmirisdr 源码的改动都在代码里用 "★ 本项目" 注明，主要有：
+  Android 上跳过 USB 端口复位、ISOC 按包拼接后再解析、504 帧带半帧暂存与按帧地址重对齐、
+  停止串流前等 2ms（内核驱动的经验值）；另新增 `mirisdr_get_sync_loss()` /
+  `mirisdr_get_last_frame_header()` / `mirisdr_test_control_transfer()` /
+  `mirisdr_test_streaming_start()` 四个自检用的入口
+
+### 参考过的其它开源实现（只参考行为，未复制代码）
+
+- **Linux 内核** `drivers/media/usb/msi2500/msi2500.c` 与 `drivers/media/tuners/msi001.c`
+  —— 这颗芯片最权威的开源实现（GPL-2.0）。它验证了三件事：硬件输出是**有符号 8 位**、
+  要 **+128** 才是 SDR 标准的无符号（`V4L2_SDR_FMT_CU8` 那条分支）；流的结构是
+  **16 字节帧头 + 1008 字节数据**、帧头头 4 字节是每帧 **+504** 的计数器；以及
+  **不需要主机下载固件**（内核驱动里没有 boot/firmware 代码）。另外它写着"停止串流前
+  至少要等 700us"，这一条本项目已采纳（见 `streaming.c`）。
+- [alexandreGellibert/libmirisdr_ForAndroid](https://github.com/alexandreGellibert/libmirisdr_ForAndroid)
+  —— 对比确认它就是上游 libmirisdr-5 原样（ISOC 逐包解析与 504 转换器均未改动）。
 
 ### 署名与再分发
 
