@@ -70,6 +70,24 @@ HC_RSSI_LO = -58.0
 HC_RSSI_HI = -35.0
 
 # ---------------------------------------------------------------------------
+# 音频自动增益（AGC）
+# ---------------------------------------------------------------------------
+# 为什么需要：调频鉴频器的输出幅度【正比于频偏】。手台/对讲的频偏只有 2.5~3 kHz，
+# 而调频广播是 25~75 kHz —— 差 10~30 倍。以前只有一套固定档位增益（NFM 8.0 / WFM 2.5），
+# 结果就是"听广播正常、听对讲机特别轻"，而且广播那边其实一直被削顶。
+# 这里改成按实测电平归一化：广播压下来（不再削顶）、对讲机抬上去，两种信号听感一致。
+AGC_TARGET = 0.22      # 目标有效值（约 -13 dBFS）
+AGC_GAIN_MIN = 0.25    # 最多压到 1/4
+AGC_GAIN_MAX = 30.0    # 最多抬 30 倍（约 30dB）
+# 包络跟踪：往上涨（信号变强）要快，往下降要慢，否则语音的停顿会把底噪抬起来
+AGC_ATTACK = 0.4
+AGC_RELEASE = 0.10
+# 信号贴到底噪（差不到这么多 dB）时最多只抬 4 倍：
+# 否则"关掉静噪听弱信号"会变成满屋子嘶嘶声（增益把噪声也归一化了）。
+AGC_MIN_SNR_DB = 8.0
+AGC_WEAK_GAIN_MAX = 4.0
+
+# ---------------------------------------------------------------------------
 # 扫描找频
 #
 # ★ 关键设计：【不要】每格重调一次硬件。
@@ -236,6 +254,9 @@ class RadioEngine:
         self._step = 12_500.0
         self._volume = 0.8
         self._squelch_on = True
+        # 音频 AGC 的状态：包络参考与当前增益（只在静噪打开时自适应）
+        self._agc_ref = 0.0
+        self._agc_gain = 1.0
         # ★ 静噪不是绝对的 dB 门限，而是"比底噪高多少 dB"。
         #   原因：8bit 采样的噪声底就在 -50 左右，而真实信号也就 -38 上下，
         #   绝对门限根本分不开这两者（实测纯噪声一样判"有声"，喇叭一直在嘶嘶响）。
@@ -605,7 +626,32 @@ class RadioEngine:
         if self._silent_ms <= 0.0:
             audio = np.zeros_like(audio)
 
-        audio = np.clip(audio * p['gain'] * self._volume, -1.0, 1.0)
+        # ---- 音频自动增益 ----
+        # 只按"静噪打开"时的电平自适应：静噪关着的那段音频已经被清零，
+        # 拿它当参考会把增益一路抬满，一开噪就是满幅嘶嘶声。
+        audio = audio * p['gain']
+        if audio.size:
+            ref = float(np.sqrt(np.mean(audio * audio)))
+            if self._open and ref > 1e-7:
+                if self._agc_ref <= 1e-9:
+                    self._agc_ref = ref
+                elif ref > self._agc_ref:
+                    self._agc_ref = (1.0 - AGC_ATTACK) * self._agc_ref + AGC_ATTACK * ref
+                else:
+                    self._agc_ref = (1.0 - AGC_RELEASE) * self._agc_ref + AGC_RELEASE * ref
+        g = 1.0
+        if self._open and self._agc_ref > 1e-9:
+            g = AGC_TARGET / self._agc_ref
+            if self._floor is not None and rssi < self._floor + AGC_MIN_SNR_DB:
+                if g > AGC_WEAK_GAIN_MAX:
+                    g = AGC_WEAK_GAIN_MAX
+            if g < AGC_GAIN_MIN:
+                g = AGC_GAIN_MIN
+            elif g > AGC_GAIN_MAX:
+                g = AGC_GAIN_MAX
+        # 增益本身也平滑一下，避免逐块跳变（推子感）
+        self._agc_gain = 0.5 * self._agc_gain + 0.5 * g
+        audio = np.clip(audio * self._agc_gain * self._volume, -1.0, 1.0)
         self._samples_out += audio.size
         return (audio * 32767.0).astype(np.int16), rssi
 
