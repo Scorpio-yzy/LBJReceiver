@@ -88,6 +88,16 @@ private const val FULL_STOP_DELAY_MS = 120000L
         private const val DRIVER_PKG = "marto.rtl_tcp_andro"
         private const val DRIVER_FDROID = "https://f-droid.org/packages/marto.rtl_tcp_andro/"
         private const val DRIVER_PLAY = "https://play.google.com/store/apps/details?id=marto.rtl_tcp_andro"
+
+        /**
+         * 本进程里 Mirics(RSP1) 驱动是否已经起过。
+         *
+         * 为什么要有它：native 侧的服务跑在【App 进程】里，Activity 重建（转屏、从后台回来被回收）
+         * 之后字段没了，但服务可能还在监听 1234。这时候再 openDevice 同一个 USB 设备会因
+         * "设备被占用"而失败 —— 而且会打扰正在跑的那个实例。用进程级标志挡住重复启动。
+         * 引擎连不上时（= 服务其实已经死了，比如拔插过）会把它清掉，让下次自动重启。
+         */
+        @Volatile private var miriDriverUp = false
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -442,6 +452,8 @@ private const val FULL_STOP_DELAY_MS = 120000L
         refreshDriverStatus()
         // 上次自检如果在 native 里崩了（App 直接闪退），这里把崩溃点告诉用户
         checkMiriProbeTrace()
+        // 每次回到前台给一次"自动重起驱动"的机会（见 startEngine 的失败分支）
+        autoRetried = false
     }
 
     override fun onDestroy() {
@@ -636,6 +648,13 @@ private const val FULL_STOP_DELAY_MS = 120000L
     // 自检时用到：pendingRsp1Dev = 刚点过的那台（可能是识别表外的新型号，授权后接着用它）
     private var pendingRsp1Dev: UsbDevice? = null
     private var usbPermRx: BroadcastReceiver? = null
+    // USB 授权回调里该做什么：true = 直接起驱动（自动切换那条路），false = 自检
+    private var pendingAutoStart = false
+    // 自动启动的时间戳与"已自动重试过"标志：
+    //   · 15 秒内不重复 open 同一个 USB 设备（第二次必然失败且会打扰在跑的实例）；
+    //   · 连不上时自动重起驱动只做一次，避免"连不上→起驱动→还连不上"打转。
+    @Volatile private var miriStartAt = 0L
+    private var autoRetried = false
     private var miriTraceChecked = false
     private var tts: TextToSpeech? = null
     private var ttsOk = false
@@ -1080,6 +1099,8 @@ private const val FULL_STOP_DELAY_MS = 120000L
 
     /** 未启动时，在标题栏里直接显示"驱动到底行不行"，不用等点了开始再猜 */
     private fun refreshDriverStatus() {
+        // 从后台回来 / 刚插上设备时也自动切一次（挂在 UI 线程，内部只改 prefs + 起后台线程）
+        autoSelectDriver()
         Thread {
             val bench = prefs.getBoolean("bench", false)
             val builtin = prefs.getBoolean("builtin", true)
@@ -2555,6 +2576,9 @@ private const val FULL_STOP_DELAY_MS = 120000L
     // -------------------------------------------------------------- 启停
     private fun startEngine() {
         if (busy || running) return
+        // ★ 先按插着的设备自动选驱动（RSP1 ↔ RTL 互切、增益档位跟着换），再决定怎么连。
+        //   这条就是"插上 RSP1 直接点开始接收就行"的关键，不必再手动点【自检】。
+        autoSelectDriver()
         busy = true
         updateButtons()
         val bench = prefs.getBoolean("bench", false)
@@ -2720,6 +2744,26 @@ private const val FULL_STOP_DELAY_MS = 120000L
                             try { Thread.sleep(1500) } catch (_: InterruptedException) { break }
                         }
                         if (!ok) {
+                            // ★ 插着 RSP1 却连不上：多半是驱动没起来（或拔插过后死了）。
+                            //   自动把"已起过"的标志清掉、重新起一次驱动，然后重走完整流程 ——
+                            //   这样用户就不必手动点【自检】。只自动重试一次，避免打转。
+                            if (!autoRetried) {
+                                val u2 = getSystemService(Context.USB_SERVICE) as UsbManager
+                                val cand = u2.deviceList.values.toList()
+                                val d2 = cand.firstOrNull { isMiriKnown(it) }
+                                    ?: cand.firstOrNull { it.vendorId == 0x1df7 }
+                                if (d2 != null && u2.hasPermission(d2)) {
+                                    autoRetried = true
+                                    miriDriverUp = false
+                                    rsp1Start(u2, d2, quiet = true)
+                                    main.postDelayed({
+                                        if (!destroyed) {
+                                            busy = false; running = false; updateButtons(); startEngine()
+                                        }
+                                    }, 2500L)
+                                    return@Thread
+                                }
+                            }
                             main.post {
                                 busy = false; running = false; updateButtons()
                                 tvHeader.text = "驱动没有就绪"
@@ -3155,7 +3199,14 @@ private const val FULL_STOP_DELAY_MS = 120000L
             override fun onReceive(c: Context?, i: Intent?) {
                 val usb = getSystemService(Context.USB_SERVICE) as UsbManager
                 val d = pendingRsp1Dev ?: return
-                if (usb.hasPermission(d)) main.post { rsp1Probe(d) }
+                if (usb.hasPermission(d)) main.post {
+                    if (pendingAutoStart) {
+                        pendingAutoStart = false
+                        rsp1Start(usb, d, quiet = true)     // 自动切换：直接起，不弹自检
+                    } else {
+                        rsp1Probe(d)                        // 手动点【自检】
+                    }
+                }
             }
         }
         try {
@@ -3244,6 +3295,78 @@ private const val FULL_STOP_DELAY_MS = 120000L
             .show()
     }
 
+    /**
+     * 按当前插着的 USB 设备【自动】选好驱动与增益档位 —— 用户不必再手动点【自检】。
+     *
+     *   · 插的是 Mirics（RSP1/RSP1A/RSP2 及同芯片克隆板）→ 切到本机 127.0.0.1:1234 服务，
+     *     并把增益档位换成「其它/网络源」（只有这张表能填 0~102 dB）；
+     *   · 插的是 RTL2832U 电视棒、而当前还停在"本机 Mirics"模式 → 切回内置驱动，
+     *     并恢复原来那套 RTL 增益档位；否则引擎会去连一个没起来的本机服务，报"连接被拒"。
+     *
+     * 自检按钮【保留】：RSP1 的取数方式、波段表对比、帧结构这些诊断还得靠它。
+     * 只动"我们自己起的本机服务"这一种模式（bench=true 且 host=127.0.0.1），
+     * 用户自己配的外部服务器（填了 IP 的台架模式）绝不碰。
+     */
+    private fun autoSelectDriver() {
+        val usb = getSystemService(Context.USB_SERVICE) as UsbManager
+        val all = usb.deviceList.values.toList()
+        val miri = all.firstOrNull { isMiriKnown(it) } ?: all.firstOrNull { it.vendorId == 0x1df7 }
+        // 一行日志说明"看到什么、选了谁" —— 远程排查（以及自检之外）全靠它
+        android.util.Log.i("LBJDRV", "USB: " + (
+            if (all.isEmpty()) "(无)" else all.joinToString(" | ") {
+                String.format(java.util.Locale.US, "%04X:%04X %s", it.vendorId, it.productId, it.deviceName)
+            }
+        ) + "  → 选 " + (if (miri != null) "Mirics(RSP1)" else "RTL/其它"))
+        val ourLocal = prefs.getBoolean("bench", false) && prefs.getString("host", "") == "127.0.0.1"
+        // ★ 用户特意配的【外部服务器】台架模式（host 填的是电脑 IP）绝不动 ——
+        //   那种模式跟插什么设备无关，切走会把他的设置弄坏。
+        val externalBench = prefs.getBoolean("bench", false) &&
+            prefs.getString("host", "").orEmpty().let { it.isNotEmpty() && it != "127.0.0.1" }
+
+        if (miri != null && !externalBench) {
+            pendingRsp1Dev = miri
+            // 已经起过 / 刚起过 15 秒内 / 手上还握着那条连接 —— 都别再 open 一次
+            if (miriDriverUp || miriConn != null ||
+                System.currentTimeMillis() - miriStartAt < 15000L) return
+            // ★ 顺序要紧：先把当前那套 RTL 档位记下来，再把它改成 OTHER。
+            //   反过来写的话读到的已经是 "OTHER"，就永远存不下原来的档位了。
+            if (prefs.getString("tuner", "") != "OTHER" &&
+                prefs.getString("tuner_rtl", "").orEmpty().isEmpty())
+                prefs.edit().putString("tuner_rtl", prefs.getString("tuner",
+                    if (prefs.getBoolean("fc0013", true)) "FC0013" else "R820T")).apply()
+            prefs.edit().putBoolean("bench", true)
+                .putString("host", "127.0.0.1")
+                .putString("tuner", "OTHER").apply()
+            // RSP1 是 0~102 dB，界面存的 19.7 那种值对它偏低（收音机会很小声）——
+            // 太低就给个合理起点，并明确告诉用户（不偷偷改）。
+            val g = prefs.getFloat("gain", 19.7f)
+            if (g < 30f) {
+                prefs.edit().putFloat("gain", 45f).apply()
+                toast("检测到 RSP1 类设备：已切换驱动与增益档位，增益设为 45 dB（可在设置里改）")
+            } else {
+                toast("检测到 RSP1 类设备：已切换驱动与增益档位")
+            }
+            if (!usb.hasPermission(miri)) {
+                ensureUsbPermReceiver()
+                pendingAutoStart = true
+                val flags = if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_IMMUTABLE else 0
+                usb.requestPermission(miri, PendingIntent.getBroadcast(this, 0,
+                    Intent("com.railfan.lbj.USB_PERMISSION").setPackage(packageName), flags))
+                return
+            }
+            rsp1Start(usb, miri, quiet = true)
+            return
+        }
+
+        val rtl = all.firstOrNull { it.vendorId == 0x0bda }
+        if (rtl != null && ourLocal) {
+            val back = prefs.getString("tuner_rtl", "").orEmpty()
+                .ifEmpty { if (prefs.getBoolean("fc0013", true)) "FC0013" else "R820T" }
+            prefs.edit().putBoolean("bench", false).putString("tuner", back).apply()
+            toast("检测到 RTL 电视棒：已切回内置驱动")
+        }
+    }
+
     /** 用户手动点名的那台：记下来，流程照走（要授权就先授权，授权完自动接自检）。 */
     private fun rsp1ForceProbe(dev: UsbDevice) {
         pendingRsp1Dev = dev
@@ -3281,8 +3404,13 @@ private const val FULL_STOP_DELAY_MS = 120000L
      * 失败时给的是"照着做就能好"的清单，而不是一句"看日志" —— 装机给别人测时用户手里
      * 没有 logcat，弹窗必须自己把下一步说清。
      */
-    private fun rsp1Start(usb: UsbManager, dev: UsbDevice) {
+    /**
+     * @param quiet true = 自动启动那条路：不弹任何对话框，成功静默、失败只提示一句。
+     *              （插上设备自动切驱动时用；用户手动点【自检】那条仍然给完整对话框。）
+     */
+    private fun rsp1Start(usb: UsbManager, dev: UsbDevice, quiet: Boolean = false) {
         val hw = miriHwFlavour(dev)
+        miriStartAt = System.currentTimeMillis()
         Thread {
             var lastErr = ""
             // 失败就等一秒再试一次：USB 子系统刚被自检用过，偶尔要缓一下才肯重新开流。
@@ -3313,6 +3441,8 @@ private const val FULL_STOP_DELAY_MS = 120000L
                         prefs.edit().putBoolean("bench", true)
                             .putString("host", "127.0.0.1")
                             .putString("tuner", "OTHER").apply()
+                        miriDriverUp = true
+                        if (quiet) return@post
                         AlertDialog.Builder(this)
                             .setTitle("RSP1 驱动已启动")
                             .setMessage("驱动已在本机 127.0.0.1:1234 提供数据。\n\n" +
@@ -3335,6 +3465,10 @@ private const val FULL_STOP_DELAY_MS = 120000L
             }
             val why = lastErr
             main.post {
+                if (quiet) {
+                    toast("RSP1 驱动没起来：" + why + "（可在设置里点【自检】看详情）")
+                    return@post
+                }
                 AlertDialog.Builder(this)
                     .setTitle("驱动没起来")
                     .setMessage("试了两次都没起来。\n\n设备：" + usbLine(dev) + "\n原因：" + why + "\n\n" +
