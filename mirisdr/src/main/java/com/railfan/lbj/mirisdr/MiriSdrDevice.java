@@ -57,6 +57,22 @@ public class MiriSdrDevice {
     public native String preferredMode();
 
     /**
+     * 自检比出来的波段表：0 = SDRplay，1 = 通用 MSi2500，-1 = 还没比过。
+     * 自检完应存进 prefs，下次启动驱动前用 setStartupChoice 塞回来。
+     */
+    public native int pickedHwFlavour();
+
+    /**
+     * 把上次自检的结论恢复进来（波段表 + 取数方式）。
+     *
+     * 这两个量是 native 静态变量，App 进程一重启就丢，会退回"按 USB PID 猜"的波段表 ——
+     * 对 1DF7:2500 正好是那套收不到数据的。必须在 openAsync 之前调用。
+     *
+     * @param hwPick -1 = 没结论（按 PID 猜）；0 = SDRplay；1 = 通用 MSi2500
+     */
+    public native void setStartupChoice(int hwPick, String mode);
+
+    /**
      * native 侧在开流成功后回调一次（与 :rtlsdr 模块的 SdrDevice 保持同名）。
      * 这里没有上层抽象要通知，留个空实现 —— 但方法必须【存在】：
      * JNI 的 GetMethodID 找不到方法会抛 NoSuchMethodError 并且一直挂着，等 native

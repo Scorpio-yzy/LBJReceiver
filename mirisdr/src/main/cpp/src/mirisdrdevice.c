@@ -709,8 +709,12 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jlon
      * （soft.c 的 hw_switch_freq_plan_sdrplay / _default）。选错的那套会把前端通路
      * 断掉 —— 现象是"USB 上有数据、但 ADC 几乎什么都收不到"（载荷里绝大多数字节是 0）。
      *
-     * 判据用【|样本| 峰值】：前端真接通时，光噪声底就有好几个 LSB；
-     * 断开时基本全程是 0。自检两台都真收一次，谁峰值高用谁，并把结论记下来给 openAsync 用。
+     * 判据用【活性】= |样本| > 8 的占比，而不是峰值：峰值只是单个样本的最大值，
+     * 直流偏移或偶发尖峰都能把它顶上去（真机上"通用 峰值 94"同屏却有 94% 的字节
+     * 挤在 02~04 —— 那是直流，不是信号）。活性才是"前端有没有在给数据"。
+     * 自检两套都真收一次，谁活性高用谁，并把结论记下来给 openAsync 用。
+     * ★ 两边都没活性 = 这次用的频率上没台（自检用的就是设置里当前的频率），
+     *   此时【不要】下结论，按 USB PID 猜，免得把用户的结论改坏。
      */
     miri_stream_result_t fl[2];
     const int flav[2] = { MIRISDR_HW_SDRPLAY, MIRISDR_HW_DEFAULT };
@@ -724,24 +728,31 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jlon
          * 两套波段表的峰值会都贴在噪声底上（之前两台都报"峰值 4"就是这么来的）。 */
         mirisdr_set_tuner_gain(dev, 90);
         miri_stream_test(dev, g_preferred_mode, 700, &fl[i]);
-        miri_trace(tracePath, "14 波段表 %s：速率=%.0f 峰值=%d 平均|x|=%d‰ 最常见=%d‰ 丢帧=%d 字节=%ld",
+        miri_trace(tracePath,
+                   "14 波段表 %s：速率=%.0f 峰值=%d 平均|x|=%d‰ 活性=%d‰ 最常见=%d‰ 丢帧=%d 字节=%ld",
                    flav_names[i], fl[i].rate, fl[i].peak_abs, fl[i].mean_abs_milli,
-                   fl[i].top_permille, fl[i].sync_loss, fl[i].bytes);
+                   fl[i].active_permille, fl[i].top_permille, fl[i].sync_loss, fl[i].bytes);
     }
     {
-        /* 哪套波段表"看得见东西"就用哪套。
-         * 要有 1.5 倍以上的差距才敢改判 —— 峰值本身有噪声，差不多的时侯按 USB PID 判就行。 */
+        /* 哪套波段表"看得见东西"就用哪套：比【活性】，要有 1.5 倍以上差距才敢改判
+         * （活性本身也有波动）。两边都没活性说明这个频率上根本没台 —— 那就别下结论，
+         * 按 USB PID 猜，免得用户下次在没台的频点上自检，把上次的好结论改坏了。 */
+        const int alive_permille = 50;
+        int a_want = fl[1].active_permille, a_now = fl[0].active_permille;
         int pick;
-        if (fl[1].peak_abs > fl[0].peak_abs * 3 / 2)
+        if (a_want < alive_permille && a_now < alive_permille)
+            pick = (hw == MIRISDR_HW_SDRPLAY) ? 0 : 1;  /* 没台，不下结论 */
+        else if (a_want > a_now * 3 / 2)
             pick = 1;                                   /* 通用板明显更好 */
-        else if (fl[0].peak_abs > fl[1].peak_abs * 3 / 2)
+        else if (a_now > a_want * 3 / 2)
             pick = 0;                                   /* SDRplay 明显更好 */
         else
             pick = (hw == MIRISDR_HW_SDRPLAY) ? 0 : 1;  /* 差不多，按 PID */
         g_hw_pick = pick;
         mirisdr_set_hw_flavour(dev, (mirisdr_hw_flavour_t) flav[pick]);
-        MIRI_LOGI("波段表选定：%s（峰值 %d vs %d）", flav_names[pick], fl[pick].peak_abs,
-                  fl[1 - pick].peak_abs);
+        MIRI_LOGI("波段表选定：%s（活性 %d‰ vs %d‰，峰值 %d vs %d）",
+                  flav_names[pick], fl[pick].active_permille, fl[1 - pick].active_permille,
+                  fl[pick].peak_abs, fl[1 - pick].peak_abs);
     }
 
     /*
@@ -1010,6 +1021,44 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_preferredMode(JNIEnv *env, jobject th
 {
     (void) thiz;
     return (*env)->NewStringUTF(env, g_preferred_mode);
+}
+
+/* 自检比出来的波段表（0 = SDRplay，1 = 通用 MSi2500，-1 = 还没比过）。
+ * App 自检完把这个值存进 prefs —— 见下面 setStartupChoice 的说明。 */
+JNIEXPORT jint JNICALL
+Java_com_railfan_lbj_mirisdr_MiriSdrDevice_pickedHwFlavour(JNIEnv *env, jobject thiz)
+{
+    (void) env;
+    (void) thiz;
+    return (jint) g_hw_pick;
+}
+
+/*
+ * ★ 把【上一次自检的结论】恢复进来。为什么需要它：
+ * 这两个量原本只是 native 里的静态变量，App 进程一重启就回到默认
+ * （波段表 -1 = 按 USB PID 猜，取数方式 "ISOC"）。
+ * 对 1DF7:2500 这种板子，按 PID 猜出来的是 SDRplay 那套波段表 —— 真机上就是峰值 10、
+ * 样本几乎是常量的那套（自检在 101.7 MHz 比出来 峰值 10 vs 通用 94）。
+ * 于是"自检通过、当时能听"的用户，第二天重开 App 直接变成收不到 —— 这种问题在
+ * 只能靠截图反馈的远程测试里最难查。
+ * App 侧在 openAsync 之前调用本函数，把自己存下来的结论塞回来。
+ */
+JNIEXPORT void JNICALL
+Java_com_railfan_lbj_mirisdr_MiriSdrDevice_setStartupChoice(JNIEnv *env, jobject thiz,
+                                                           jint hwPick, jstring mode)
+{
+    (void) thiz;
+    if (hwPick >= 0 && hwPick <= 1)
+        g_hw_pick = (int) hwPick;
+    if (mode != NULL) {
+        const char *m = (*env)->GetStringUTFChars(env, mode, 0);
+        if (m != NULL) {
+            if (strcmp(m, "ISOC") == 0 || strcmp(m, "BULK") == 0)
+                snprintf(g_preferred_mode, sizeof(g_preferred_mode), "%s", m);
+            (*env)->ReleaseStringUTFChars(env, mode, m);
+        }
+    }
+    MIRI_LOGI("恢复上次自检结论：波段表 %d，取数方式 %s", g_hw_pick, g_preferred_mode);
 }
 
 JNIEXPORT void JNICALL

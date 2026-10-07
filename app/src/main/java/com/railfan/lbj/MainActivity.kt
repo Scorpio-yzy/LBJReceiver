@@ -3272,6 +3272,14 @@ private const val FULL_STOP_DELAY_MS = 120000L
             } catch (t: Throwable) {
                 "自检异常：" + (t.message ?: t.toString())
             }
+            // ★ 把自检的结论落盘。这两个量在 native 里只是静态变量，App 进程一重启就丢，
+            //   会退回"按 USB PID 猜"的波段表 —— 对 1DF7:2500 正好是收不到数据的那套。
+            //   不落盘的话，用户会遇到"自检通过、当时能听，第二天重开 App 就收不到"。
+            try {
+                val pick = miriDevice!!.pickedHwFlavour()
+                val mode = miriDevice!!.preferredMode()
+                prefs.edit().putInt("miri_hw_pick", pick).putString("miri_mode", mode).apply()
+            } catch (_: Throwable) { }
             try { conn.close() } catch (_: Throwable) { }
             main.post {
                 val bad = res.contains("失败") || res.contains("异常")
@@ -3490,6 +3498,14 @@ private const val FULL_STOP_DELAY_MS = 120000L
                     // 增益：prefs 里是 dB，rtl_tcp 协议走 0.1dB 单位
                     val gainTenth = Math.round(prefs.getFloat("gain", 19.7f) * 10f)
                     val freqHz = Math.round(prefs.getFloat("freq", FREQ_MHZ.toFloat()) * 1e6)
+                    // 先把【上次自检的结论】恢复进 native（App 重启后 native 里就没了：
+                    // 波段表会退回按 PID 猜，对 1DF7:2500 是收不到数据的那套），
+                    // 再问它"用哪种取数方式" —— 这时 preferredMode() 返回的就是恢复后的值。
+                    try {
+                        miriDevice!!.setStartupChoice(
+                            prefs.getInt("miri_hw_pick", -1),
+                            prefs.getString("miri_mode", "ISOC") ?: "ISOC")
+                    } catch (_: Throwable) { }
                     // 取数方式用自检试出来的那个（ISOC / BULK 哪个能出数据）
                     val mode = try { miriDevice!!.preferredMode() } catch (t: Throwable) { null } ?: "ISOC"
                     ok = miriDevice!!.openAsync(miriDevice!!.handle(), conn.fileDescriptor,
