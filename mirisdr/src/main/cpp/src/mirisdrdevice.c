@@ -389,7 +389,7 @@ static void miri_stream_test(mirisdr_dev_t *dev, const char *mode, int ms,
 }
 
 /* 自检时试出来的、能出数据的方式。openAsync 用它，省得再试一遍。 */
-static char g_preferred_mode[8] = "BULK";
+static char g_preferred_mode[8] = "ISOC";
 
 static void miri_closed_cb(sdrtcp_t *tcp, void *ctx)
 {
@@ -588,36 +588,39 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jint
      *   而且 ISOC 跑过之后接口往往还挂在 ISO 那档上，紧接着切 BULK 会失败，
      *   这就是上一版"ISOC 有数据、BULK 起流失败"的由来。
      */
-    miri_stream_result_t res_bulk, res_iso;
-    miri_trace(tracePath, "9 试收数据（BULK）…");
-    miri_stream_test(dev, "BULK", 900, &res_bulk);
-    miri_trace(tracePath, "10 BULK：起流=%d 字节=%ld 速率=%.0f 块数=%ld 块长 %u~%u 非1024倍数=%ld "
+    miri_stream_result_t res_iso, res_bulk;
+    miri_trace(tracePath, "9 试收数据（ISOC）…");
+    miri_stream_test(dev, "ISOC", 900, &res_iso);
+    miri_trace(tracePath, "10 ISOC：起流=%d 字节=%ld 速率=%.0f 块数=%ld 块长 %u~%u 非1024倍数=%ld "
                           "直流=%d 最常见字节=%d‰ 丢帧=%d",
-               res_bulk.started, res_bulk.bytes, res_bulk.rate, res_bulk.cb_count,
-               res_bulk.cb_min, res_bulk.cb_max, res_bulk.cb_unaligned, res_bulk.dc_mean,
-               res_bulk.top_permille, res_bulk.sync_loss);
+               res_iso.started, res_iso.bytes, res_iso.rate, res_iso.cb_count,
+               res_iso.cb_min, res_iso.cb_max, res_iso.cb_unaligned, res_iso.dc_mean,
+               res_iso.top_permille, res_iso.sync_loss);
 
-    if (res_bulk.rate > 0) {
-        snprintf(g_preferred_mode, sizeof(g_preferred_mode), "BULK");
-        res_iso = res_bulk;
-        res_iso.rate = -1;       /* ISOC 没试过，报告里标一下 */
+    if (res_iso.rate > 0) {
+        snprintf(g_preferred_mode, sizeof(g_preferred_mode), "ISOC");
+        res_bulk = res_iso;
+        res_bulk.rate = -1;      /* BULK 没试过，报告里标一下 */
     } else {
-        miri_trace(tracePath, "11 试收数据（ISOC，BULK 没出数据才试）…");
-        miri_stream_test(dev, "ISOC", 900, &res_iso);
-        miri_trace(tracePath, "12 ISOC：起流=%d 字节=%ld 速率=%.0f 块数=%ld 块长 %u~%u 非1024倍数=%ld "
+        /* ISOC 不行才试 BULK。注意这台设备上 BULK 的 alt 档切不过去，
+         * 而且失败过的尝试会污染接口（这条已在 read_async 里修掉）——
+         * 所以顺序是 ISOC 优先，BULK 只当兜底。 */
+        miri_trace(tracePath, "11 试收数据（BULK，ISOC 没出数据才试）…");
+        miri_stream_test(dev, "BULK", 900, &res_bulk);
+        miri_trace(tracePath, "12 BULK：起流=%d 字节=%ld 速率=%.0f 块数=%ld 块长 %u~%u 非1024倍数=%ld "
                               "直流=%d 最常见字节=%d‰ 丢帧=%d",
-                   res_iso.started, res_iso.bytes, res_iso.rate, res_iso.cb_count,
-                   res_iso.cb_min, res_iso.cb_max, res_iso.cb_unaligned, res_iso.dc_mean,
-                   res_iso.top_permille, res_iso.sync_loss);
+                   res_bulk.started, res_bulk.bytes, res_bulk.rate, res_bulk.cb_count,
+                   res_bulk.cb_min, res_bulk.cb_max, res_bulk.cb_unaligned, res_bulk.dc_mean,
+                   res_bulk.top_permille, res_bulk.sync_loss);
         snprintf(g_preferred_mode, sizeof(g_preferred_mode), "%s",
-                 res_iso.rate > 0 ? "ISOC" : "BULK");
+                 res_bulk.rate > 0 ? "BULK" : "ISOC");
     }
     MIRI_LOGI("取数方式选定：%s", g_preferred_mode);
 
     /* 一行一块，尽量短，能一屏看完 */
     n += snprintf(msg + n, sizeof(msg) - n, "\n真收一段数据（应约 1.92 MS/s）：\n");
-    const char *names[2] = {"BULK", "ISOC"};
-    const miri_stream_result_t *rs[2] = {&res_bulk, &res_iso};
+    const char *names[2] = {"ISOC", "BULK"};
+    const miri_stream_result_t *rs[2] = {&res_iso, &res_bulk};
     for (int k = 0; k < 2; k++) {
         const miri_stream_result_t *x = rs[k];
         if (x->rate < 0)
@@ -634,13 +637,11 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jint
             n += snprintf(msg + n, sizeof(msg) - n, "  %s：起流失败（%d）\n", names[k], x->started);
         }
     }
-    if (res_bulk.rate > 0) {
+    if (res_iso.rate > 0) {
         n += snprintf(msg + n, sizeof(msg) - n,
-                      "  采用的取数方式：BULK（整块传输，504 帧天然对齐）\n");
-    } else if (res_iso.rate > 0) {
-        n += snprintf(msg + n, sizeof(msg) - n,
-                      "  采用的取数方式：ISOC（BULK 没出数据；ISOC 按微帧给数据，"
-                      "块长不是 1024 的整数倍就会有错位）\n");
+                      "  采用的取数方式：ISOC（驱动会把每批包拼连续、再按 1024 帧重组）\n");
+    } else if (res_bulk.rate > 0) {
+        n += snprintf(msg + n, sizeof(msg) - n, "  采用的取数方式：BULK（整块传输）\n");
     } else {
         n += snprintf(msg + n, sizeof(msg) - n,
                       "  两种取数方式都没收到数据 —— 把这一屏发我\n");

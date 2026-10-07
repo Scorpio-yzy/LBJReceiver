@@ -103,6 +103,17 @@ struct mirisdr_dev {
     uint8_t             *samples;
     int                 samples_size;
     int                 sync_loss_cnt;
+    /* ★ 本项目新增（Android）：504 帧重组 + ISOC 拼包。
+     * 走 ISOC 时每个回调只给"一个微帧有多少"（1.92 MS/s 下才几百字节），
+     * 一帧 1024 字节必然被切开；而且包在 URB 缓冲里是按"请求长度"留间隔的，
+     * 所以要先拼成连续一块、再按帧地址连续解析。详见 convert/504_s8.c。 */
+    unsigned char       frame_buf[4096];
+    int                 frame_have;
+    uint32_t            frame_expected;
+    int                 frame_expected_known;
+    int                 frame_lost;
+    unsigned char       *iso_gather;
+    int                 iso_gather_size;
 
     /* dc offset calibration */
     enum {

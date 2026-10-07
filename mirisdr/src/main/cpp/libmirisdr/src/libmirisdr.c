@@ -124,6 +124,19 @@ int mirisdr_setup (mirisdr_dev_t **out_dev, mirisdr_dev_t *dev) {
     dev->transfer = MIRISDR_TRANSFER_BULK;
 #endif
 
+    /* ★ 本项目新增：ISOC 拼包缓冲（8 个包 × 最多 3072 字节，再留一帧余量）。
+     * ISOC 的包在 URB 缓冲里是按"请求长度"留间隔的，必须自己拼成连续一块再解析。 */
+    dev->iso_gather_size = 32768;
+    dev->iso_gather = (unsigned char *) malloc(dev->iso_gather_size);
+    if (dev->iso_gather == NULL)
+        goto failed;
+
+    /* 504 帧重组状态：新一次打开要从干净状态开始 */
+    dev->frame_have = 0;
+    dev->frame_expected = 0;
+    dev->frame_expected_known = 0;
+    dev->frame_lost = 0;
+
     mirisdr_adc_init(dev);
     mirisdr_set_hard(dev);
     mirisdr_set_soft(dev);
@@ -282,6 +295,7 @@ int mirisdr_close (mirisdr_dev_t *p) {
     if (p->ctx) libusb_exit(p->ctx);
 
     if (p->samples) free(p->samples);
+    if (p->iso_gather) free(p->iso_gather);
 
     free(p);
 
