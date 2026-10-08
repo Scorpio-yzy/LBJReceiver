@@ -23,6 +23,7 @@
 """
 import json
 import os
+import re
 import threading
 import time
 
@@ -436,8 +437,21 @@ class TripLog:
                 self._open.pop(k, None)
 
     # ---------------------------------------------------------------- 落盘
+    # ★ 只接受严格的 YYYY-MM-DD。以前只在外层查"长度 == 10"，
+    #   而 '../../a123' 正好 10 个字符 —— 导入一份手工构造的历史 JSON 就能让
+    #   _write_day 往 App 私有目录之外写 .json（路径遍历）。
+    _DATE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+
+    @classmethod
+    def valid_date(cls, date):
+        d = str(date or '').strip()
+        return bool(cls._DATE_RE.match(d)) and os.path.basename(d) == d
+
     def _path(self, date):
-        return os.path.join(self._root, date + '.json')
+        d = str(date or '').strip()
+        if not TripLog.valid_date(d):
+            raise ValueError('非法日期: %r' % (date,))
+        return os.path.join(self._root, d + '.json')
 
     def _load(self, date):
         """取某一天的记录（第一次访问才读文件；读坏了当空，别让历史把引擎带崩）。"""
@@ -654,7 +668,7 @@ class TripLog:
                         if not isinstance(day, dict):
                             continue
                         date = str(day.get('date') or '').strip()
-                        if len(date) != 10:
+                        if not TripLog.valid_date(date):
                             continue
                         for t in (day.get('trips') or []):
                             if self._add_trip(date, self._norm_trip(dict(t))):
@@ -688,7 +702,7 @@ class TripLog:
                     continue
                 trip[k] = cell.strip()
             date = trip.get('date') or ''
-            if len(date) != 10:
+            if not TripLog.valid_date(date):
                 continue
             for nk in ('n_msg',):
                 try:

@@ -449,9 +449,29 @@ class RadioEngine:
     def has_source(self):
         return self._src is not None
 
+    def _restore_rate(self):
+        """把数据源采样率还原成预警器要的 960k。
+
+        ★ 扫描为了扫得快会把速率提到 2.4M（SCAN_RATE），而这条 TCP 连接【不会重连】——
+          交回预警器前不还原的话，预警器的 DSP 链（半带 960k→240k、÷5→48k、1200 波特）
+          会去解 2.4M 的流：频率/带宽整体错位、解不出任何车次，
+          而且只有"停止→开始"（重连时 _reader_task 才重发速率）才恢复。
+        """
+        if self._src is None:
+            return
+        if int(getattr(self, '_scan_rate', RTL_RATE) or RTL_RATE) == int(RTL_RATE):
+            return
+        try:
+            self._set_rate(RTL_RATE)
+            print('LBJ: 交回预警器前把采样率还原为 %d' % int(RTL_RATE), flush=True)
+        except Exception as e:
+            print('LBJ-ERR 还原采样率失败: %s' % e, flush=True)
+        self._scan_rate = int(RTL_RATE)
+
     def yield_source(self):
         """把数据源交出去（切回预警器），只停线程，不动连接。"""
         self.stop()
+        self._restore_rate()
         src = self._src
         self._src = None
         return src
@@ -459,6 +479,7 @@ class RadioEngine:
     def release_source(self):
         """彻底关掉数据源。"""
         self.stop()
+        self._restore_rate()
         src = self._src
         self._src = None
         if src is not None:
@@ -534,6 +555,9 @@ class RadioEngine:
                     self._err = '扫描失败: %s' % e
                     print('LBJ-RADIO-ERR scan: %s' % e, flush=True)
                     self._scan = None
+                    # 扫描把速率提到过 2.4M：异常退出这条路以前不还原，
+                    # 于是收音机/预警器都按错的速率继续跑（频率全错、解不出东西）。
+                    self._restore_rate()
                 n += len(iq)
                 if block_reads % 40 == 0:
                     s = self._scan
@@ -1151,6 +1175,10 @@ class RadioEngine:
             'best': None, 'cur_hz': lo, 'msg': '正在找本地广播台…',
             'lo': lo, 'hi': hi, 'want': 0, 'n': 0, 'sum': 0.0, 'fs': MID_RATE,
             'freq': float(self._freq), 'ppm0': int(self._ppm),
+            # ★ 校准会临时把收音机调到 FM 广播台量载波；用户原来在听的频率必须记下来，
+            #   结束（或中途取消）时调回去。不记的话 Kotlin 会把"引擎频率变了"当成
+            #   用户调谐，把 FM 台写回当前信道 —— 点一次校准，信道就变成 87~108MHz。
+            'orig_freq': float(self._freq),
             'offset_hz': None, 'meas_hz': None, 'ppm_delta': None,
             'ppm_suggest': None, 'resid_hz': None,
         }
@@ -1161,6 +1189,13 @@ class RadioEngine:
     def stop_autocalib(self):
         if self._autocal is not None:
             self._autocal['stop'] = True
+            # 取消也要调回原频率：这时可能已经调到 FM 台在量载波了
+            try:
+                of = self._autocal.get('orig_freq')
+                if of:
+                    self.set_frequency(float(of))
+            except Exception:
+                pass
         return True
 
     def clear_autocalib(self):
@@ -1288,6 +1323,13 @@ class RadioEngine:
         c['phase'] = 'done'
         c['done'] = True
         c['msg'] = '校准完成：ppm=%d，复测残差 %+.0f Hz' % (c['ppm0'], c['offset_hz'] or 0.0)
+        # 校准时听的是 FM 广播台：结束就把收音机调回用户原来在听的频率
+        try:
+            of = c.get('orig_freq')
+            if of:
+                self.set_frequency(float(of))
+        except Exception as e:
+            print('LBJ-ERR 校准后恢复收听频率失败: %s' % e, flush=True)
         print('LBJ: 自动校准完成  应用 ppm=%d  复测残差 %+.0f Hz'
               % (c['ppm0'], c['offset_hz'] or 0.0), flush=True)
 
@@ -1344,7 +1386,11 @@ class RadioEngine:
         delta = -off / float(c['freq']) * 1e6
         c['offset_hz'] = round(off, 1)
         c['ppm_delta'] = round(delta, 1)
+        # ★ ppm 建议值必须夹紧：dc 只要偏 0.1 就是 ~12kHz≈122ppm 的误判，
+        #   而 libmirisdr/librtlsdr 的 ppm 会直接写进晶振校正 —— 不夹的话会越校越偏。
         c['ppm_suggest'] = int(round(c['ppm0'] + delta))
+        if c['ppm_suggest'] > 200: c['ppm_suggest'] = 200
+        if c['ppm_suggest'] < -200: c['ppm_suggest'] = -200
         c['done'] = True
         c['feed'] = False
         print('LBJ: %s %.4f MHz  载波偏 %+.0f Hz  当前 ppm=%d  建议 %+d'

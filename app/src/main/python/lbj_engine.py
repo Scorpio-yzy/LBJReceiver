@@ -771,18 +771,36 @@ class LbjEngine:
         if src is None:
             return False
         self._src = src
+        # ★ 不能无条件把错误清掉并声称"已打开"：连接其实已死时，resume() 会返回 True，
+        #   Kotlin 把 running 置 True，随后 DSP 线程读到 EOF 立刻报错退出 ——
+        #   界面表现是"已切回/已恢复"之后马上翻回停止。
+        err = None
         try:
-            self._src._error = None
+            err = self._src._error
         except Exception:
-            pass
+            err = None
+        if err:
+            print('LBJ-ERR 交回的数据源已失效（%s），需要重连' % err, flush=True)
+            try:
+                self._src._error = None      # 让下一次真正重连时能重新判定
+            except Exception:
+                pass
         self._paused_conn = True
-        self._opened = True
+        self._opened = not err
         # 收音机期间频率/增益都改过了，这里恢复成预警器自己的一套。
         #
         # ★ set_frequency() 收的是【MHz】（它内部自己乘 1e6），
         #   而 R._g2['freq'] 存的是 Hz —— 直接传过去等于把 Hz 当 MHz，
         #   界面上的频率会显示成一长串乱码（真机上出现过），
         #   实际下发给调谐器的频率也被乘爆了。用自己的 freq_mhz 最稳。
+        # ★ 采样率必须一起恢复：扫描会把数据源改成 2.4M（见 lbj_radio.start_scan），
+        #   而 TCP 连接不会重连 —— 只恢复频率/增益的话，预警器的 DSP 链（按 960k 设计）
+        #   会去解 2.4M 的数据流：频率、带宽全错，解不出任何车次，
+        #   只有"停止再开始"（重连，走到 _reader_task 的下发）才恢复。
+        try:
+            self.set_sample_rate(self._sample_rate)
+        except Exception:
+            pass
         try:
             self.set_frequency(self.freq_mhz)
         except Exception:
@@ -889,7 +907,13 @@ class LbjEngine:
             elif n % 200 == 0:
                 print('LBJ: 已处理 %d 块  rssi=%s gate=%s' % (
                     n, R._g2.get('rssi'), R._g2.get('rssi_gate')), flush=True)
-        self._running = False
+        # ★ 只有"仍然是当前代"的线程才有资格把 running 置 False。
+        #   否则：pause() 的 join(1.5s) 超时（驱动卡一下队列空、read() 最长 10s）时
+        #   self._thread 已被置 None，随后 resume() 起了【新一代】线程并置 _running=True，
+        #   而这条旧线程醒来退出循环时又把 _running 写成 False ——
+        #   新线程处理完当前块就退出，界面 running 变 False、频谱卡住。
+        if gen == self._gen:
+            self._running = False
         print('LBJ: DSP 线程结束 gen=%d n=%d err=%r' % (gen, n, self._err), flush=True)
         # 只有"仍然是当前代"的线程才有资格推送最终状态。
         # 被 stop() 作废的旧线程到这里直接闭嘴。
@@ -1353,7 +1377,9 @@ class LbjEngine:
             'eta_seconds': g2.get('eta_seconds'),
             'eta_distance_km': g2.get('eta_distance_km'),
             'approach': g2.get('eta_status') in _APPROACH_STATES,
-            'line_samples': {k: len(v) for k, v in self._line.items()},
+            # ★ 必须持锁：DSP 线程在锁内 setdefault 会新增键，
+            #   不持锁时 dict 可能在推导式遍历中途变大 → RuntimeError（整帧快照被丢弃）。
+            'line_samples': self._line_counts(),
             'end_pos': self.extra.get('end_pos'),
             'lon': self.extra.get('lon'),
             'lat': self.extra.get('lat'),
@@ -1386,6 +1412,14 @@ class LbjEngine:
             # 列车接收历史：界面上按钮的角标用（今天收了几趟）
             'history': self.history_stats_dict(),
         }
+
+    def _line_counts(self):
+        """给界面用的"每条线路收了多少样本"。持 self._lock 取，避免遍历时字典被改。"""
+        try:
+            with self._lock:
+                return {k: len(v) for k, v in self._line.items()}
+        except Exception:
+            return {}
 
     def snapshot_json(self):
         return json.dumps(self.snapshot(), ensure_ascii=False)
@@ -1476,10 +1510,23 @@ class LbjEngine:
         return rate, warn
 
     def _gain_table(self):
-        """当前调谐器的有效增益档位表（'OTHER' = 非 RTL 的网络源，直通）。"""
-        if self.tuner == 'OTHER':
+        """当前调谐器的有效增益档位表（'OTHER' = 非 RTL 的网络源，直通）。
+
+        ★ 必须和 snap_gain() 用同一个口径：snap_gain 优先信【设备自报的型号】
+          （rtl_tcp 握手包里的 magic/dongleType），而这里原来只看人工设置的 self.tuner。
+          两者不一致时（例如设备其实是 R820T、设置里选了 FC0013），界面按 FC0013 的表
+          给档位、实际下发的却是 R820T 表里的值 —— 界面上显示"实际增益"是个表外值。
+        """
+        name = self.tuner
+        try:
+            hint = R._g2.get('tuner_hint')
+            if hint:
+                name = hint
+        except Exception:
+            pass
+        if name == 'OTHER':
             return _PASSTHROUGH_GAINS
-        return FC0013_GAINS if self.tuner == 'FC0013' else R.R820T_GAINS
+        return FC0013_GAINS if name == 'FC0013' else R.R820T_GAINS
 
     def set_tuner(self, name):
         """选择调谐器型号：'R820T' / 'FC0013' / 'OTHER'（非 RTL 的网络源，增益直通）"""
