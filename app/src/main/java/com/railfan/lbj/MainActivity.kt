@@ -1593,6 +1593,10 @@ private const val FULL_STOP_DELAY_MS = 120000L
             Locale.US, "%s   RSSI %.0f   门限 %.0f   %s",
             radioMode, lastRssi, lastThreshold, st
         )
+        // 本机 Mirics(RSP1) 驱动在跑时，把实际生效的前端波段表也摆出来 ——
+        // 表选错时现象是"频谱在抖但没有信号峰、一点声音都没有"，
+        // 远程只有截图，屏幕上没这一行就无从判断。
+        if (miriDriverUp) statusText += "   [表:" + miriFlavLabel().replace("（RSP1/RSP1A/RSP2）", "") + "]"
         // 频段与制式不匹配：摆到状态行上（截图能带回来），并提示一次
         val suggest = suggestRadioMode(radioFreqHz)
         if (suggest != null) {
@@ -3343,7 +3347,11 @@ private const val FULL_STOP_DELAY_MS = 120000L
             try {
                 val pick = miriDevice!!.pickedHwFlavour()
                 val mode = miriDevice!!.preferredMode()
-                prefs.edit().putInt("miri_hw_pick", pick).putString("miri_mode", mode).apply()
+                // ★ pick < 0 = 这次自检的频点上没台，native 明确表示"不是结论"。
+                //   这时【绝不能】写 prefs：写的要么是猜测、要么会把上次的好结论冲掉。
+                //   （真机事故就是这个：一个"没台时的猜测"被落盘，之后每个版本都继承它。）
+                if (pick >= 0) prefs.edit().putInt("miri_hw_pick", pick).apply()
+                prefs.edit().putString("miri_mode", mode).apply()
             } catch (_: Throwable) { }
             try { conn.close() } catch (_: Throwable) { }
             main.post {

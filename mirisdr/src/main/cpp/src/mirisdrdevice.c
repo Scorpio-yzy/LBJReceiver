@@ -56,13 +56,28 @@ typedef struct {
     uint32_t out_cap;
     unsigned char carry[4];  /* 上一块的最后 4 个字节：跨块那一个样点的窗口要用 */
     int carry_n;
-    /* libmirisdr 的 S8 是【有符号】的，rtl_tcp/App 的约定是【无符号、直流 127.5】。
+    /* libmirisdr 的 S8 名义上是【有符号】，rtl_tcp/App 的约定是【无符号、直流 127.5】。
      * 不转换的话 App 会把负数样本当成 128..255，正负样本各偏一个方向 —— 波形整个撕开。
-     * 到底要不要 +128，用开头几 KB 的直流均值自动判（有符号 ≈ 0，无符号 ≈ 128）。 */
+     *
+     * ★ 极性判定（踩过坑，别再改回"均值 >= 64"那种拍脑袋阈值）：
+     *   真机上见过两种设备：数据以 0 为中心（有符号）、和以 128 为中心（本来就是无符号）。
+     *   判据改成"哪种搬法让数据更【居中】"：
+     *     不搬（A）：偏离 = |b - 128|
+     *     搬 +128（B）：偏离 = |(int8_t)b|
+     *   取偏离小的那个 —— 不需要任何阈值，两种情况都能选对。
+     *
+     *   还要跳过开头：设备刚起流那段常是常量（实测全 03/04，均值 ≈ 3），
+     *   拿它判就会把一台以 128 为中心的设备判成"有符号"，然后【整段流】都被 +128，
+     *   居中的数据被搬到 0x00/0xFF 两端环绕 —— 现象是"频谱只剩抖动、信号峰消失、
+     *   一点声音都没有"。而且判一次就不再变，于是整场都废。 */
     int add128;
-    int dc_known;
-    long dc_sum;
+    int dc_known;            /* 已经用够样本定下极性 */
+    long dc_sum;             /* 只用于日志：开头这段的直流均值 */
     int dc_count;
+    long pol_skip;           /* 开头先丢掉的字节数（等设备稳定） */
+    long pol_a;              /* Σ|b-128|：不搬时的偏离 */
+    long pol_b;              /* Σ|int8(b)|：搬 +128 时的偏离 */
+    long pol_n;              /* 上面两个和用了多少样本 */
 } miri_device_t;
 
 /* 把一个原始字节搬到 rtl_tcp 的无符号约定（直流 127.5）上 */
@@ -230,18 +245,45 @@ static void miri_read_cb(unsigned char *buf, uint32_t len, void *ctx)
     if (d == NULL || d->dev == NULL || buf == NULL || len == 0)
         return;
 
-    /* 开头几 KB 先量直流，判"有符号 / 无符号"（有符号数据均值 ≈ 0，无符号 ≈ 128）。
-     * 量够之前按最可能的情况（有符号）先跑，判错了也只是开头几毫秒的事。 */
-    if (!d->dc_known) {
-        for (uint32_t i = 0; i < len; i++)
+    /* 极性：先丢掉开头（设备稳定前那几 KB 常是常量），再用"哪种搬法更居中"定下来；
+     * 定下来之后还继续慢慢核对，万一当初判反了能自己纠正回来。 */
+    if (d->pol_skip < 65536) {
+        d->pol_skip += (long) len;
+    } else {
+        for (uint32_t i = 0; i < len; i++) {
+            int a = (int) buf[i] - 128;
+            if (a < 0) a = -a;
+            int b = (int) (int8_t) buf[i];
+            if (b < 0) b = -b;
+            d->pol_a += a;
+            d->pol_b += b;
+            d->pol_n++;
             d->dc_sum += buf[i];
-        d->dc_count += (int) len;
-        if (d->dc_count >= 8192) {
-            int mean = (int) (d->dc_sum / d->dc_count);
-            d->add128 = (mean >= 64) ? 0 : 1;
+            d->dc_count++;
+        }
+        if (!d->dc_known && d->pol_n >= 262144) {
+            d->add128 = (d->pol_b < d->pol_a) ? 1 : 0;
             d->dc_known = 1;
-            MIRI_LOGI("实测直流均值 %d -> 按%s数据搬到 rtl_tcp 无符号约定", mean,
+            MIRI_LOGI("极性判定：直流均值 %d，Σ|b-128|=%ld vs Σ|int8(b)|=%ld -> %s",
+                      (int) (d->dc_sum / (d->dc_count > 0 ? d->dc_count : 1)),
+                      d->pol_a, d->pol_b,
                       d->add128 ? "有符号（+128）" : "本来就是无符号");
+        } else if (d->dc_known && d->pol_n >= 262144) {
+            /* ★ 自纠正：只在"当前这套明显很糟、另一套明显好得多"时才翻，
+             *   免得安静频点上两套差不多时来回跳（每跳一次都是一个咔哒声）。 */
+            int cur_bad = d->add128 ? (d->pol_b > d->pol_a * 4) : (d->pol_a > d->pol_b * 4);
+            int cur_dev = d->add128 ? (int) (d->pol_b / d->pol_n) : (int) (d->pol_a / d->pol_n);
+            if (cur_bad && cur_dev > 40) {
+                d->add128 = !d->add128;
+                MIRI_LOGI("极性判反了，自动纠正为%s（偏离 %d）",
+                          d->add128 ? "有符号（+128）" : "本来就是无符号", cur_dev);
+            }
+            /* 窗口滚动：和清零重新累计（pol_skip 不动，别再跳开头那段） */
+            d->pol_a = 0;
+            d->pol_b = 0;
+            d->pol_n = 0;
+            d->dc_sum = 0;
+            d->dc_count = 0;
         }
     }
 
@@ -492,6 +534,9 @@ static void miri_stream_test(mirisdr_dev_t *dev, const char *mode, int ms,
 static char g_preferred_mode[8] = "ISOC";
 /* 自检时比出来"前端接得进来"的那套波段表（0 = SDRplay，1 = 通用；-1 = 还没比过） */
 static int g_hw_pick = -1;
+/* 上面那个 -1/0/1 是不是【真有信号的比较】得出来的结论。
+ * 0 = 只是"没台时的猜测"，不能当结论存下来、也不能被 App 落盘。 */
+static int g_hw_pick_confident = 0;
 
 static void miri_closed_cb(sdrtcp_t *tcp, void *ctx)
 {
@@ -763,32 +808,42 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jlon
                    flav_names[i], fl[i].rate, fl[i].peak_abs, fl[i].mean_abs_milli,
                    fl[i].active_permille, fl[i].top_permille, fl[i].sync_loss, fl[i].bytes);
     }
+    int chosen;          /* 这次自检把设备停在哪个表上（不代表"结论"） */
+    int no_signal;
     {
         /* 哪套波段表"看得见东西"就用哪套：比【活性】，要有 1.5 倍以上差距才敢改判
-         * （活性本身也有波动）。两边都没活性说明这个频率上根本没台 —— 那就别下结论，
-         * 按 USB PID 猜，免得用户下次在没台的频点上自检，把上次的好结论改坏了。 */
+         * （活性本身也有波动）。
+         *
+         * ★★ 两边都没活性 = 这个频率上没台 = 【这不是一次有效的比较】。
+         *    此时绝对不能把结果当成结论：
+         *      · 不写 g_hw_pick（连"按 PID 猜"的值也不写）—— 那是个猜测，
+         *        被当成结论存下来之后，每次启动驱动都会用它；
+         *      · 真机事故：用户在没台的频点上自检一次 → 猜测（1DF7:2500 的 PID 默认是
+         *        SDRplay 表）被落盘 → 之后每个版本都忠实恢复这个坏值 →
+         *        现象是"自检全成功，但从那以后收不到任何信号、换制式换增益都没用"，
+         *        而用户看到的是"每升一版都更烂"（其实是同一个坏值被一直继承）。
+         *    这次自检本身仍然按"上次的结论/按 PID"把设备停下（chosen），只是不当作结论。 */
         const int alive_permille = 50;
         int a_want = fl[1].active_permille, a_now = fl[0].active_permille;
-        int pick;
-        int no_signal = (a_want < alive_permille && a_now < alive_permille);
-        if (no_signal)
-            /* 这个频率上没台：两套表都测不出活性，不能据此改判 ——
-             * 保留【上次】的结论（没有才按 USB PID 猜）。
-             * ★ 别在这里写死"按 PID 猜"：那会用 PID 默认值把用户上次在真有台的频点上
-             *   比出来的好结论冲掉。真机现象就是"自检跑了一轮之后反而一点声音都没有了"，
-             *   而且用户只会看到"自检全成功"。 */
-            pick = (g_hw_pick >= 0) ? g_hw_pick : ((hw == MIRISDR_HW_SDRPLAY) ? 0 : 1);
-        else if (a_want > a_now * 3 / 2)
-            pick = 1;                                   /* 通用板明显更好 */
-        else if (a_now > a_want * 3 / 2)
-            pick = 0;                                   /* SDRplay 明显更好 */
-        else
-            pick = (hw == MIRISDR_HW_SDRPLAY) ? 0 : 1;  /* 差不多，按 PID */
-        g_hw_pick = pick;
-        mirisdr_set_hw_flavour(dev, (mirisdr_hw_flavour_t) flav[pick]);
-        MIRI_LOGI("波段表选定：%s（活性 %d‰ vs %d‰，峰值 %d vs %d）",
-                  flav_names[pick], fl[pick].active_permille, fl[1 - pick].active_permille,
-                  fl[pick].peak_abs, fl[1 - pick].peak_abs);
+        no_signal = (a_want < alive_permille && a_now < alive_permille);
+        if (no_signal) {
+            chosen = (g_hw_pick >= 0) ? g_hw_pick : ((hw == MIRISDR_HW_SDRPLAY) ? 0 : 1);
+            g_hw_pick_confident = 0;
+        } else {
+            if (a_want > a_now * 3 / 2)
+                chosen = 1;                                   /* 通用板明显更好 */
+            else if (a_now > a_want * 3 / 2)
+                chosen = 0;                                   /* SDRplay 明显更好 */
+            else
+                chosen = (hw == MIRISDR_HW_SDRPLAY) ? 0 : 1;  /* 差不多，按 PID */
+            g_hw_pick = chosen;
+            g_hw_pick_confident = 1;
+        }
+        mirisdr_set_hw_flavour(dev, (mirisdr_hw_flavour_t) flav[chosen]);
+        MIRI_LOGI("波段表%s：%s（活性 %d‰ vs %d‰，峰值 %d vs %d）",
+                  no_signal ? "（本次没台，不作为结论，沿用上次）" : "选定",
+                  flav_names[chosen], fl[chosen].active_permille, fl[1 - chosen].active_permille,
+                  fl[chosen].peak_abs, fl[1 - chosen].peak_abs);
     }
 
     /*
@@ -874,17 +929,21 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jlon
             n += snprintf(msg + n, miri_left(n, sizeof(msg)),
                           "  %s：一个字节都没收到（起流 %d）\n", flav_names[i], fl[i].started);
     }
-    n += snprintf(msg + n, miri_left(n, sizeof(msg)), "  选用的波段表：%s\n", flav_names[g_hw_pick]);
-    if (fl[0].active_permille < 50 && fl[1].active_permille < 50)
+    n += snprintf(msg + n, miri_left(n, sizeof(msg)), "  本次停用的波段表：%s\n",
+                  flav_names[chosen]);
+    if (no_signal)
         n += snprintf(msg + n, miri_left(n, sizeof(msg)),
-                      "  （这个频率上没台，两套都测不出活性 —— 波段表沿用上次的结论，\n"
-                      "    想重新比就在【本地有台的频点】上再自检一次；也可以在设置里手动指定）\n");
+                      "  【这个频率上没台】两套波段表都测不出活性 —— 本次不作为结论，\n"
+                      "  驱动继续用【上次的结论】（没结论时按 USB 型号猜）。\n"
+                      "  要重新比，请在【本地确实有台的频点】上再自检一次，\n"
+                      "  也可以在【设置 → 前端波段表】里手动指定。\n");
 
-    /* 字节分布/载荷/帧头一律取自【选用】的那套。上一版取自"第一个出数据的取数方式"，
+    /* 字节分布/载荷/帧头一律取自【本次实际用的】那套。上一版取自"第一个出数据的取数方式"，
      * 而那次用的是另一个波段表，于是屏幕上出现"选用通用 MSi2500"下面却摆着 SDRplay
-     * 那套的死数据 —— 自相矛盾，白跑一轮远程测试。 */
+     * 那套的死数据 —— 自相矛盾，白跑一轮远程测试。
+     * ★ 这里必须用 chosen，不能用 g_hw_pick：没台时 g_hw_pick 可能是 -1，会数组越界。 */
     {
-        const miri_stream_result_t *c = &fl[g_hw_pick];
+        const miri_stream_result_t *c = &fl[chosen];
         if (c->rate > 0) {
             n += snprintf(msg + n, miri_left(n, sizeof(msg)),
                           "  以下数据来自【选用】的那套 ——\n"
@@ -1014,10 +1073,14 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_openAsync(
     d->client_rate = client_rate;
     d->carry_n = 0;
     /* 方向默认按"有符号"（libmirisdr 的 S8 就是有符号），第一块数据会自己纠正 */
-    d->add128 = 1;
+    d->add128 = 1;          /* 还没判之前先按有符号跑，判错也只是开头几毫秒 */
     d->dc_known = 0;
     d->dc_sum = 0;
     d->dc_count = 0;
+    d->pol_skip = 0;
+    d->pol_a = 0;
+    d->pol_b = 0;
+    d->pol_n = 0;
     pthread_mutex_unlock(&d->lock);
 
     sdrtcp_serve_client_async(&d->tcp, (void *) d, miri_command_cb, miri_closed_cb);
@@ -1077,7 +1140,9 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_pickedHwFlavour(JNIEnv *env, jobject 
 {
     (void) env;
     (void) thiz;
-    return (jint) g_hw_pick;
+    /* ★ 只回报【真有信号的比较】得出的结论；没台时那次比较不算结论，返回 -1，
+     *   让 App 不要把一个猜测落盘（这个坏值会被之后每个版本一直继承）。 */
+    return (jint) (g_hw_pick_confident ? g_hw_pick : -1);
 }
 
 /*
@@ -1095,8 +1160,10 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_setStartupChoice(JNIEnv *env, jobject
                                                            jint hwPick, jstring mode)
 {
     (void) thiz;
-    if (hwPick >= 0 && hwPick <= 1)
+    if (hwPick >= 0 && hwPick <= 1) {
         g_hw_pick = (int) hwPick;
+        g_hw_pick_confident = 1;   /* 存下来的只可能是"真有信号的比较"结论 */
+    }
     if (mode != NULL) {
         const char *m = (*env)->GetStringUTFChars(env, mode, 0);
         if (m != NULL) {
