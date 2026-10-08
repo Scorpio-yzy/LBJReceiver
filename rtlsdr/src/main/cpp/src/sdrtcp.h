@@ -50,6 +50,9 @@ struct sdrtcp {
     volatile int listen_socket;
     /* ★ 本项目新增：客户端来不及取、被丢掉的块数（诊断用） */
     volatile unsigned long dropped;
+    /* ★ 本项目新增：服务线程（tcp_server）是否已彻底走完（含 closedcb）；
+     *   sdrtcp_free() 靠它决定能不能安全销毁结构/互斥量。 */
+    volatile int worker_done;
 };
 
 void sdrtcp_init(sdrtcp_t * obj);

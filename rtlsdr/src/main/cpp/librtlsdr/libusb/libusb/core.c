@@ -1289,6 +1289,11 @@ int API_EXPORTED libusb_open2(libusb_device *dev, libusb_device_handle **handle,
 
 	_handle->dev = libusb_ref_device(dev);
 	_handle->claimed_interfaces = 0;
+	/* ★ 本移植新增 libusb_open2 时漏了这一行（上游 libusb_open 里有）：
+	 *   op_claim_interface / op_release_interface 会读它，非 0 就会去走
+	 *   detach_kernel_driver_and_claim 分支 —— 读的是 malloc 出来的未初始化内存，
+	 *   行为随机（Android 上可能多做一次内核驱动摘除尝试）。 */
+	_handle->auto_detach_kernel_driver = 0;
 	memset(&_handle->os_priv, 0, priv_size);
 
 	r = usbi_backend->open2(_handle, fd);

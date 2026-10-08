@@ -73,9 +73,18 @@ public class RtlSdrDevice extends SdrDevice {
         return "rtl-sdr "+usbDevice.getDeviceName();
     }
 
+    /**
+     * ★ 必须把 UsbDeviceConnection 长期持有：fd 的所有者是它，不是那个 int。
+     *   以前这里拿到 fd 之后连接就没人引用了 —— GC 之后 finalize() 会 close 掉这个 fd，
+     *   而 native 侧（dup 之后）用的是另一份 fd，所以现在即使连接被回收也不会
+     *   再误伤 native 的 fd；但持着它更稳：流在跑的时候绝不希望 fd 被谁关掉。
+     */
+    private UsbDeviceConnection heldConnection;
+
     private int openSessionAndGetFd() throws ExecutionException, InterruptedException {
         UsbDeviceConnection deviceConnection = UsbPermissionObtainer.obtainFdFor(context, usbDevice).get();
         if (deviceConnection == null) throw new RuntimeException("Could not get a connection");
+        heldConnection = deviceConnection;
         int fd = deviceConnection.getFileDescriptor();
         Log.appendLine("Opening fd "+fd);
         return fd;

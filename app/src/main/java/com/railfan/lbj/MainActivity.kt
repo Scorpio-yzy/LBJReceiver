@@ -100,12 +100,34 @@ private const val FULL_STOP_DELAY_MS = 120000L
         @Volatile private var miriDriverUp = false
     }
 
+    /**
+     * 统一的对话框出口 —— 所有 .showSafe() 都走这里。
+     *
+     * 为什么必须收口：弹窗大半来自长任务的回调（首次 Python 初始化 10~30 秒、USB 自检数秒，
+     * 都是后台线程做完再 main.post 回来弹）。用户在这期间退出时，onDestroy 里那句
+     * removeCallbacksAndMessages(null) 只能清掉【当时已经入队】的消息，
+     * 之后才入队的对话框照样会执行 —— 那时 Activity 的 window token 已经失效，
+     * AlertDialog.showSafe() 抛 WindowManager$BadTokenException，未捕获就是一次闪退。
+     * 这种崩溃在只靠截图的远程测试里表现为"用着用着就退了"，极难定位。
+     */
+    private fun AlertDialog.Builder.showSafe(): AlertDialog? =
+        if (destroyed || isFinishing || isDestroyed) null else show()
+
+    /** 已经 create() 好的对话框同样要挡住（字段里存着、可能晚一步才 show）。 */
+    private fun AlertDialog.showSafe() {
+        if (!(destroyed || isFinishing || isDestroyed)) show()
+    }
+
     private val main = Handler(Looper.getMainLooper())
     private var module: PyObject? = null
-    private var engine: PyObject? = null
-    private var sink: StateSink? = null
-    private var busy = false
-    private var running = false
+    // ★ engine/sink/busy/running 都是"后台线程写、主线程读"（反之亦然）：
+    //   startEngine 的后台线程写 engine，onDestroy 在主线程读它去 stop。
+    //   没有 @Volatile 时主线程可能读到过期的 null，于是【新引擎不会被停】——
+    //   Activity 已销毁，进程里却还留着 DSP 线程和到 127.0.0.1:1234 的 socket 在耗电。
+    @Volatile private var engine: PyObject? = null
+    @Volatile private var sink: StateSink? = null
+    @Volatile private var busy = false
+    @Volatile private var running = false
     // 后台线程（启动/GPS）用来判断 Activity 是不是已经没了。
     // 首次初始化 Python 要 10~30 秒，用户完全可能中途退出。
     @Volatile private var destroyed = false
@@ -199,9 +221,9 @@ private const val FULL_STOP_DELAY_MS = 120000L
     @Volatile private var radioVfo = false
     private var radioCtcss = 0.0
 
-    private var radioEngine: PyObject? = null
+    @Volatile private var radioEngine: PyObject? = null
     private var radioModule: PyObject? = null
-    private var audioSink: AudioSink? = null
+    @Volatile private var audioSink: AudioSink? = null
 
     @Volatile private var inRadio = false
     @Volatile private var pendingRadio = false
@@ -395,10 +417,18 @@ private const val FULL_STOP_DELAY_MS = 120000L
         if (running && effectiveHost() != before) {
             toast("地址已改为 " + effectiveHost() + "，需要【停止】后重新【开始接收】才生效")
         }
+        // ★ 先把 extras 里的新值写进 prefs，再谈"同步给引擎"。
+        //   顺序反了（原来就是这样）的话：下面那个线程去读 prefs 时，新值还没写进去，
+        //   引擎拿到的仍是旧公里标 —— 用户看到提示、实际没生效。
+        //   （alarmkm / beep / alarm 不用管：maybeAlarm 每次都实时读 prefs。）
+        if (intent.hasExtra("mykm")) {
+            prefs.edit().putFloat("mykm", intent.getFloatExtra("mykm", -1f)).apply()
+        }
+        if (intent.hasExtra("alarmkm")) {
+            prefs.edit().putFloat("alarmkm", intent.getFloatExtra("alarmkm", 5f)).apply()
+        }
         // ★ 运行中通过 adb 改本站公里标，必须【立刻】应用到引擎。
-        // 只写 prefs 的话，用户（或测试脚本）以为改了，引擎其实还用着旧值 ——
-        // 和"设置对话框在停止态下谎报已应用"是同一类问题。
-        // （alarmkm / beep / alarm 不用管：maybeAlarm 每次都实时读 prefs。）
+        // 只写 prefs 的话，用户（或测试脚本）以为改了，引擎其实还用着旧值。
         if (running) {
             val eng = engine
             if (eng != null) {
@@ -410,12 +440,6 @@ private const val FULL_STOP_DELAY_MS = 120000L
                     } catch (_: Throwable) { }
                 }.start()
             }
-        }
-        if (intent.hasExtra("mykm")) {
-            prefs.edit().putFloat("mykm", intent.getFloatExtra("mykm", -1f)).apply()
-        }
-        if (intent.hasExtra("alarmkm")) {
-            prefs.edit().putFloat("alarmkm", intent.getFloatExtra("alarmkm", 5f)).apply()
         }
         // ★ 插上电视棒时 UsbDelegate 会把我们拉起来并带上这个标记 —— 直接开始接收。
         //   只有用户启用了「使用内置驱动」才自动开始：没开的话数据源是外部驱动 App
@@ -475,29 +499,56 @@ private const val FULL_STOP_DELAY_MS = 120000L
         val re = radioEngine
         radioEngine = null
         val eng0 = engine
-        if (re != null && eng0 != null) {
-            try { eng0.callAttr("give_source", re.callAttr("yield_source")) } catch (_: Throwable) { }
-        } else if (re != null) {
-            try { re.callAttr("release_source") } catch (_: Throwable) { }
-        }
         val eng = engine
         engine = null
         sink = null
         if (eng != null) {
             Thread {
-                // 先解绑推送目标，再停 —— 否则被停掉的引擎还会往已销毁的 Activity 推状态
-                try { eng.callAttr("set_push", null) } catch (_: Throwable) { }
+                // ★ yield_source/give_source 必须在这个后台线程里做：
+                //   RadioEngine.stop() 内部 join(2.0)，give_source 末尾还会 resume() 起线程。
+                //   放在主线程上等，最长能把主线程按住 2 秒以上（ANR）—— 与本函数开头
+                //   那句"主线程上绝不做阻塞收尾"的注释本来就矛盾，这里补上。
+                if (re != null) {
+                    try { eng.callAttr("give_source", re.callAttr("yield_source")) } catch (_: Throwable) { }
+                } else {
+                    // 先解绑推送目标，再停 —— 否则被停掉的引擎还会往已销毁的 Activity 推状态
+                    try { eng.callAttr("set_push", null) } catch (_: Throwable) { }
+                }
                 try { eng.callAttr("stop") } catch (_: Throwable) { }
+            }.start()
+        } else if (re != null) {
+            Thread {
+                try { re.callAttr("release_source") } catch (_: Throwable) { }
             }.start()
         }
         try { tone?.release(); tone = null } catch (_: Throwable) { }
         // 语音引擎也要关掉，不然它会一直占着（下次进 App 还会接着念没念完的）
         try { tts?.stop() } catch (_: Throwable) { }
         try { tts?.shutdown(); tts = null } catch (_: Throwable) { }
+        // 对话框必须显式 dismiss，否则窗口泄漏（日志里一堆 WindowLeaked，个别 ROM 上还会崩）
+        for (d in listOf(histDialog, scanDialog, calibDialog, chDialog)) {
+            try { d?.takeIf { it.isShowing }?.dismiss() } catch (_: Throwable) { }
+        }
         EngineService.stop(this)      // 引擎都停了，前台服务也要撤掉
         // 内置驱动要【彻底停掉】而不只是解绑：只解绑的话服务照样活着、占着 USB，
         // 退出 App 后电视棒就一直打不开，而通知栏的通知却已经消失。
         BuiltinDriver.stop(this)
+        // ★ RSP1(Mirics) 这条路以前退出时【什么都不做】：native 的 rtl_tcp 服务、USB 接口、
+        //   1234 端口全靠进程被回收才释放。进程被系统缓存时（返回桌面就属于这种），
+        //   电视棒/板子一直打不开，用户以为是硬件坏了。
+        //   注意只用 stop + 关连接：close(handle) 会把 native 结构 free 掉，而 sdrtcp 的
+        //   worker 线程可能还在用它（见 MiriSdrDevice.java 里 releaseUsb 的说明）。
+        try {
+            val md = miriDevice
+            if (md != null && (miriDriverUp || miriConn != null)) {
+                try { md.stop(md.handle()) } catch (_: Throwable) { }
+                try { miriConn?.close() } catch (_: Throwable) { }
+                miriConn = null
+                miriDriverUp = false
+                miriStartAt = 0L
+                android.util.Log.i("MiriSdrDriver", "退出界面：已停流并放开 USB（句柄保留）")
+            }
+        } catch (_: Throwable) { }
     }
 
     /**
@@ -549,7 +600,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                                 }
                             }
                             .setNegativeButton("知道了", null)
-                            .show()
+                            .showSafe()
                     }
                 }
             }
@@ -642,6 +693,10 @@ private const val FULL_STOP_DELAY_MS = 120000L
     // ---------------------------------------------------------- 告警音 / 语音播报
     private var tone: ToneGenerator? = null
     private var lastTrainTs = 0.0
+    // 告警/提示音去重：车次 -> 上次响的时刻（10 分钟内同一趟车不再响；LBJ 会周期重发）
+    private val alarmBeeped = HashMap<String, Long>()
+    private val alarmRang = HashMap<String, Long>()
+    private val ALARM_REPEAT_MS = 10 * 60 * 1000L
     private var lastRateWarn = ""
     // RSP1 类设备（Mirics MSi2500/MSi001）：本机自带的 rtl_tcp 服务由它提供
     private var miriDevice: MiriSdrDevice? = null
@@ -868,7 +923,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                         "② 系统的「位置信息」开关是否打开\n" +
                         "③ 本应用的位置权限是否允许\n\n" +
                         "刚打开定位的话，稍等十几秒再点一次通常会更快。")
-                    .setPositiveButton("好", null).show()
+                    .setPositiveButton("好", null).showSafe()
             } else {
                 runLocate(eng, loc)
             }
@@ -976,7 +1031,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                                 "\n当前线路样本数：" + cnt +
                                 "\n\n请让 App 多收几趟车（每趟车都会带来一组" +
                                 "公里标+经纬度" + "），样本够了再点一次。")
-                            .setPositiveButton("好", null).show()
+                            .setPositiveButton("好", null).showSafe()
                     } else {
                         val km = o.optDouble("km", -1.0)
                         prefs.edit().putFloat("mykm", km.toFloat()).apply()
@@ -985,7 +1040,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                             .setMessage(String.format(Locale.US,
                                 "线路：%s\n本站公里标：%.1f km\n（离最近的线路折线约 %d 米，用了 %d 个样本）\n\n%s\n已自动写入【全局本站公里标】",
                                 o.optString("route"), km, o.optInt("dist_m", 0), o.optInt("samples", 0), where))
-                            .setPositiveButton("好", null).show()
+                            .setPositiveButton("好", null).showSafe()
                     }
                 }
             } catch (t: Throwable) {
@@ -1024,9 +1079,18 @@ private const val FULL_STOP_DELAY_MS = 120000L
             if (!x.optBoolean("muted", false)) { t = x; break }
         }
         t ?: return                                  // 列表里全是本车 → 不响
-        val ts = t.optDouble("ts", 0.0)
-        if (ts <= lastTrainTs) return          // 同一条不重复响
-        lastTrainTs = ts
+
+        // ★ 去重必须按【车次】而不是 ts：引擎合并同一趟车时会把 merged['ts'] 刷成最新，
+        //   而 LBJ 每隔几秒就重发一次 —— 用 ts 判"是不是新的"等于没判，
+        //   同一趟车会每几秒响一次（用户会觉得提示音疯了）。
+        //   提示音和接近告警分别记：先用远处看到、后来才接近的车，仍然要响告警。
+        val key = t.optString("tkey", "").ifEmpty { t.optString("train", "") }
+        if (key.isEmpty()) return
+        val nowMs = System.currentTimeMillis()
+        alarmBeeped.entries.removeAll { nowMs - it.value > ALARM_REPEAT_MS }
+        alarmRang.entries.removeAll { nowMs - it.value > ALARM_REPEAT_MS }
+        val firstBeep = !alarmBeeped.containsKey(key)
+        val firstAlarm = !alarmRang.containsKey(key)
 
         val status = o.optString("eta_status", "")
         val dist = if (o.isNull("eta_distance_km")) Double.MAX_VALUE
@@ -1038,14 +1102,18 @@ private const val FULL_STOP_DELAY_MS = 120000L
         voiceTrigger(t, t.optString("train", ""))
 
         if (near) {
-            // 接近告警：独立开关，关掉就完全静音
-            if (prefs.getBoolean("alarm", true)) {
+            // 接近告警：独立开关，关掉就完全静音；同一趟车只响一次
+            if (firstAlarm && prefs.getBoolean("alarm", true)) {
+                alarmRang[key] = nowMs
                 beep(true)
                 vibrate(600)
             }
         } else {
-            // 普通提示音：另一个独立开关
-            if (prefs.getBoolean("beep", true)) beep(false)
+            // 普通提示音：另一个独立开关；同一趟车只响一次
+            if (firstBeep && prefs.getBoolean("beep", true)) {
+                alarmBeeped[key] = nowMs
+                beep(false)
+            }
         }
     }
 
@@ -1149,7 +1217,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 "确认后回到本 App 再点一次【开始接收】。")
             .setPositiveButton("知道了", null)
             .setNeutralButton("重试") { _, _ -> startEngine() }
-            .show()
+            .showSafe()
     }
 
     /** 内置驱动没起来时的提示：措辞与外部驱动那条区分开，对症检查 */
@@ -1171,7 +1239,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 "确认后回到本 App 再点一次【开始接收】。")
             .setPositiveButton("知道了", null)
             .setNeutralButton("重试") { _, _ -> startEngine() }
-            .show()
+            .showSafe()
     }
 
     /**
@@ -1217,7 +1285,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
             .setPositiveButton(R.string.go_fdroid) { _, _ -> openUrl(DRIVER_FDROID) }
             .setNeutralButton(R.string.go_play) { _, _ -> openUrl(DRIVER_PLAY) }
             .setNegativeButton(R.string.later, null)
-            .show()
+            .showSafe()
     }
 
     // ============================================================ 收音机
@@ -1796,7 +1864,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
             .setPositiveButton("编辑当前信道") { _, _ -> showChannelEdit(curChannel) }
             .setNegativeButton("关闭", null)
             .create()
-        chDialog?.show()
+        chDialog?.showSafe()
     }
 
     /** 信道列表的适配器：编号 + 名称 + 频率/制式/亚音 */
@@ -1845,7 +1913,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
             )
             .setAdapter(ChAdapter()) { _, which -> writeChannel(which) }
             .setNegativeButton(R.string.ch_cancel, null)
-            .show()
+            .showSafe()
     }
 
     private fun writeChannel(idx: Int) {
@@ -1864,7 +1932,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
             )
             .setPositiveButton("覆盖") { _, _ -> doWriteChannel(idx) }
             .setNegativeButton(R.string.ch_cancel, null)
-            .show()
+            .showSafe()
     }
 
     private fun doWriteChannel(idx: Int) {
@@ -1932,7 +2000,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
             AlertDialog.Builder(this)
                 .setTitle("模拟亚音 CTCSS（Hz）")
                 .setItems(items) { _, w -> c.ctcss = RadioChannel.CTCSS_TONES[w]; refresh() }
-                .show()
+                .showSafe()
         }
         refresh()
 
@@ -1964,7 +2032,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 }
             }
             .setNegativeButton(R.string.ch_cancel, null)
-            .show()
+            .showSafe()
     }
 
     private var radioScanRunnable: Runnable? = null
@@ -2027,7 +2095,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
             // PPM 校准单独一个入口：它不扫描，只是"停下来量一下载波偏了多少"
             .setNeutralButton("PPM 校准") { _, _ -> showCalibChooser() }
             .setNegativeButton(R.string.ch_cancel, null)
-            .show()
+            .showSafe()
     }
 
     /**
@@ -2048,7 +2116,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 if (w == 0) startAutocal() else startCalib()
             }
             .setNegativeButton(R.string.ch_cancel, null)
-            .show()
+            .showSafe()
     }
 
     /**
@@ -2082,7 +2150,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                         autocalActive = false
                     }
                     .create()
-                calibDialog?.show()
+                calibDialog?.showSafe()
             }
         }.start()
     }
@@ -2104,7 +2172,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
             AlertDialog.Builder(this)
                 .setTitle("自动 PPM 校准")
                 .setMessage(c.optString("msg", "没成功"))
-                .setPositiveButton("知道了", null).show()
+                .setPositiveButton("知道了", null).showSafe()
             return
         }
         val sug = c.optInt("ppm_suggest", 0)
@@ -2120,7 +2188,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 c.optDouble("meas_hz", 0.0), sug, c.optDouble("resid_hz", 0.0)
             ))
             .setPositiveButton("好", null)
-            .show()
+            .showSafe()
     }
 
     private fun startCalib() {
@@ -2151,7 +2219,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
             .setView(tv)
             .setNegativeButton("取消", null)
             .create()
-        calibDialog?.show()
+        calibDialog?.showSafe()
     }
 
     private fun renderCalib(c: JSONObject?) {
@@ -2183,7 +2251,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 toast(String.format(Locale.US, "PPM 已设为 %d（接近器也已同步）", sug))
             }
             .setNegativeButton("关闭", null)
-            .show()
+            .showSafe()
     }
 
     private fun startScan(fine: Boolean, marginDb: Double = 7.0) {
@@ -2244,7 +2312,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 setScanMargin(v.toDouble())
             }
             .setNegativeButton(R.string.ch_cancel, null)
-            .show()
+            .showSafe()
     }
 
     private fun setScanMargin(v: Double) {
@@ -2310,7 +2378,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 showScanMarginDialog()
             }
         }
-        scanDialog?.show()
+        scanDialog?.showSafe()
     }
 
     /** 结果表的一行：序号 + 频率 + 制式/强度（复用信道行的布局） */
@@ -2351,7 +2419,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
             .setTitle("清空扫描结果？")
             .setPositiveButton("清空") { _, _ -> clearScanResults() }
             .setNegativeButton(R.string.ch_cancel, null)
-            .show()
+            .showSafe()
     }
 
     private fun clearScanResults() {
@@ -2373,7 +2441,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
             .setTitle("把 " + fmtMhz(f) + " MHz 设为当前频率？")
             .setPositiveButton("是") { _, _ -> setScanFreq(f, r.optString("mode", radioMode)) }
             .setNegativeButton("否", null)
-            .show()
+            .showSafe()
     }
 
     /** 定为当前收听频率：先停扫描，再切到那个频率（顺便切到它复核时用的制式）。 */
@@ -2406,7 +2474,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
             .setTitle("存到信道 · " + fmtMhz(f) + " MHz")
             .setAdapter(ChAdapter()) { _, which -> writeChannel(which) }
             .setNegativeButton(R.string.ch_cancel, null)
-            .show()
+            .showSafe()
     }
 
     /**
@@ -2515,7 +2583,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 updateChannelBar()
                 saveVfoState()
             }
-            .show()
+            .showSafe()
     }
 
     // ---------------- 频率模式自己的一套设置（与信道互不影响） ----------------
@@ -2550,7 +2618,10 @@ private const val FULL_STOP_DELAY_MS = 120000L
      * 95.9000 → 95.9，438.5000 → 438.5，457.8250 → 457.825（到 1Hz 的精度一个不丢）。
      */
     private fun fmtMhzText(mhz: Double): String {
-        val s = String.format(Locale.US, "%.3f", mhz).trimEnd('0').trimEnd('.')
+        // ★ %.3f 会把 821.2375 显示成 821.238（差 500Hz），而铁路频率正是 25kHz
+        //   栅格上的四位小数 —— 同屏的信道栏却是四位，用户会以为频率"被吞了"。
+        //   这里和输入框保持一致：算到 4 位再去尾零。
+        val s = String.format(Locale.US, "%.4f", mhz).trimEnd('0').trimEnd('.')
         return s.ifEmpty { "0" }
     }
 
@@ -3226,6 +3297,10 @@ private const val FULL_STOP_DELAY_MS = 120000L
         }
         pendingRsp1Dev = dev
         if (!usb.hasPermission(dev)) {
+            // ★ 用户点的是【自检】：必须清掉"授权后自动起驱动"的意图。
+            //   否则如果之前 autoSelectDriver 设过 pendingAutoStart=true 而系统弹窗还没处理，
+            //   授权广播一到会去起驱动 —— 用户要的自检变成了别的动作。
+            pendingAutoStart = false
             ensureUsbPermReceiver()
             val flags = if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_IMMUTABLE else 0
             // setPackage：把这个广播明确限定给自己，免得被 Android 14 的隐式广播限制挡掉
@@ -3276,7 +3351,12 @@ private const val FULL_STOP_DELAY_MS = 120000L
         // ★ 自检要【独占】设备：正在跑的驱动拿着接口，不先关掉就必然
         //   claim_interface 失败 -6 (LIBUSB_ERROR_BUSY) —— 真机反馈就是这个：
         //   一打开 App 自动起了驱动，之后点自检就去开同一个设备，直接被自己挡住。
-        val takeover = miriDriverUp || miriConn != null || miriDevice != null
+        // ★ 判"驱动是不是真的在跑"只能用这两个：miriDriverUp（起流成功过）和 miriConn
+        //   （Java 侧握着的连接）。不能把 miriDevice 算进来 —— 它只是个 native 句柄容器，
+        //   创建后【从不置空】（句柄要保留复用），算进来会让"跑过一次自检之后，
+        //   以后每次自检都弹会中断接收的确认、还会在自检结束后无条件重启驱动"。
+        val wasRunning = miriDriverUp || miriConn != null
+        val takeover = wasRunning
         // ★ 自检要独占设备，会把正在跑的驱动停掉 —— 正在听收音机的人会突然"没声音了"，
         //   而收音机屏幕上【没有】开始接收那个按钮，用户自己没办法把驱动再拉起来。
         //   所以先问一句，并说明后面要重新进收音机（自检完 App 会自己把驱动起回来）。
@@ -3293,7 +3373,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                     rsp1Probe(dev)
                 }
                 .setNegativeButton("取消", null)
-                .show()
+                .showSafe()
             return
         }
         miriProbeConfirmed = false
@@ -3325,7 +3405,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                             "① 把其它收音机 / SDR / 电视 App 全部清掉\n" +
                             "② 拔了重插，再点一次自检")
                         .setPositiveButton("知道了", null)
-                        .show()
+                        .showSafe()
                 }
                 return@Thread
             }
@@ -3369,8 +3449,8 @@ private const val FULL_STOP_DELAY_MS = 120000L
                          else ""))
                     .setPositiveButton("启动驱动") { _, _ -> rsp1Start(usb, dev) }
                     .setNegativeButton("关闭", null)
-                    .show()
-                if (takeover) {
+                    .showSafe()
+                if (wasRunning) {
                     // ★ 自检前是我们把驱动停掉的：这里自动起回来。否则用户回到收音机发现
                     //   一点声音都没有，而收音机屏幕上【没有】开始接收那个按钮，
                     //   他自己没办法把驱动再拉起来 —— 真机上就是这样"突然没声音了"。
@@ -3399,7 +3479,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                     "插好之后系统一般会弹一下『已连接 USB 设备』；看到它了再点一次自检。\n" +
                     "（RTL 电视棒能用、只有这个棒子不认，基本就是 ① 或 ②）")
                 .setPositiveButton("知道了", null)
-                .show()
+                .showSafe()
             return
         }
         val names = all.map { usbLine(it) }.toTypedArray()
@@ -3410,7 +3490,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 "没有它、或者点了还是不行，请把这一屏【截图】发我。")
             .setItems(names) { _, i -> rsp1ForceProbe(all[i]) }
             .setNegativeButton("关闭", null)
-            .show()
+            .showSafe()
     }
 
     /**
@@ -3559,7 +3639,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
             .setMessage(txt.trim() + "\n\n把这一屏截图发我。")
             .setPositiveButton("知道了") { _, _ -> try { f.delete() } catch (_: Throwable) { } }
             .setNegativeButton("先留着", null)
-            .show()
+            .showSafe()
     }
 
     /**
@@ -3628,7 +3708,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                                 "现在点【开始接收】即可。要换回 RTL 电视棒：" +
                                 "把设置里的【台架模式】取消勾选。")
                             .setPositiveButton("知道了", null)
-                            .show()
+                            .showSafe()
                     }
                     return@Thread
                 }
@@ -3655,7 +3735,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                         "请把【自检结果】那一屏截图发我\n" +
                         "③ 还不行就把手机重启一次（USB 子系统偶尔会卡在占用状态）")
                     .setPositiveButton("知道了", null)
-                    .show()
+                    .showSafe()
             }
         }.start()
     }
@@ -3783,7 +3863,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 histOpen.launch(arrayOf("text/*", "application/json", "application/octet-stream"))
             }
         }
-        histDialog?.show()
+        histDialog?.showSafe()
         refreshDaysAndList()
     }
 
@@ -3856,7 +3936,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
             .setTitle("车次 " + s("train"))
             .setMessage(sb.toString())
             .setPositiveButton("关闭", null)
-            .show()
+            .showSafe()
     }
 
     private fun showHistExportDialog() {
@@ -3877,7 +3957,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 histCreate.launch("LBJ列车历史-" + tag + "." + pendingHistFmt)
             }
             .setNegativeButton(R.string.ch_cancel, null)
-            .show()
+            .showSafe()
     }
 
     private fun confirmHistClear() {
@@ -3897,7 +3977,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 }.start()
             }
             .setNegativeButton(R.string.ch_cancel, null)
-            .show()
+            .showSafe()
     }
 
     // 导出：系统的"新建文件"选择器（不需要存储权限，位置用户自己定）
@@ -4211,7 +4291,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 dlg.dismiss()
             }
         }
-        dlg.show()
+        dlg.showSafe()
     }
 
     // ---------------------------------------------- 关注车次 / 关注模式 / 乘车模式
@@ -4272,7 +4352,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 }.start()
             }
             .setNegativeButton("取消", null)
-            .show()
+            .showSafe()
     }
 
     // -------------------------------------------------------------- 渲染

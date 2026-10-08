@@ -275,6 +275,9 @@ int mirisdr_open_fd (mirisdr_dev_t **p, int fd) {
     
     r = libusb_wrap_sys_device(dev->ctx, (intptr_t)fd, &dev->dh);
     if (r || dev->dh == NULL){
+        /* ★ libusb_init 已经成功，这里漏了 libusb_exit —— 每次打开失败泄漏一个 context
+         *   （含事件管道的 fd 与线程资源）。反复失败会累积，和上面 dup 泄漏是同一类病。 */
+        libusb_exit(dev->ctx);
         free(dev);
         return -1;
     }

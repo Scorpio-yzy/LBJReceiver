@@ -37,7 +37,10 @@ public abstract class Log {
 	@UsedByJni
 	public static void appendLine(String what) {
 		android.util.Log.d("RtlSdr", what);
-		while (what.charAt(what.length()-1) == '\n') {
+		// ★ 空串 / 只有换行的串会让 length()-1 == -1 → charAt(-1) 抛
+		//   StringIndexOutOfBoundsException。这是 native common_logf 经 JNI 调进来的
+		//   回调（@UsedByJni），异常发生在 native 调用的线程上，会直接把 App 带走。
+		while (what.length() > 0 && what.charAt(what.length()-1) == '\n') {
 			what = what.substring(0, what.length()-1);
 		}
 		what+="\n";

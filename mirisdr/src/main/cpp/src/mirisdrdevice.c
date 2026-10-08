@@ -476,11 +476,15 @@ static void miri_stream_test(mirisdr_dev_t *dev, const char *mode, int ms,
     out->cb_unaligned = s.cb_unaligned;
     if (s.dc_n > 0)
         out->dc_mean = (int) (s.dc_sum / s.dc_n);
-    /* 极性约定：与串流路径 miri_read_cb 用同一套判据 ——
-     * 原始字节均值 >= 64 说明设备本身给的就是"以 128 为中心"的无符号数据（不加 128）；
-     * 否则是有符号数据（串流时 +128 搬到 128 中心）。
-     * 自检的数字必须按同一口径算，否则一台好设备会被报成"轨到轨饱和"。 */
-    out->centered_unsigned = (s.dc_n > 0) && ((s.dc_sum / s.dc_n) >= 64);
+    /* 极性约定：必须与串流路径 miri_read_cb 用【同一套判据】——比"哪种搬法让数据更居中"：
+     *     Σ|b-128|（当成已经是 128 中心） vs Σ|int8(b)|（当成有符号、要 +128）
+     *   取小的那个。哪种居中就按哪种算 |x|。
+     *
+     * ★ 别再用"字节均值 >= 64"这种拍脑袋判据：字节均值对【两种约定都≈128】
+     *   （有符号数据的负样本是补码，-1 就是 0xFF），于是恒判成"无符号"，
+     *   对真·有符号设备算出来的 |x| 是 128-|x|（反的），活性恒≈100% ——
+     *   自检是用户没有 adb 时唯一的诊断手段，口径反了整屏数字都不可信。 */
+    out->centered_unsigned = (s.abs_n > 0) && (s.abs_sum_u < s.abs_sum);
     if (out->centered_unsigned) {
         out->mean_abs_milli = (s.abs_n > 0) ? (int) (s.abs_sum_u * 1000 / s.abs_n) : 0;
         out->active_permille = (s.abs_n > 0) ? (int) (s.act_n_u * 1000 / s.abs_n) : 0;
@@ -984,15 +988,20 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_openAsync(
     if (d == NULL)
         return JNI_FALSE;
 
-    const char *devicePath = (*env)->GetStringUTFChars(env, devicePath_, 0);
-    const char *address = (*env)->GetStringUTFChars(env, address_, 0);
+    /* ★ JNI 字符串：jstring 可能为 NULL，GetStringUTFChars 也可能因 OOM 返回 NULL；
+     *   而且【只能把 GetStringUTFChars 返回的那个指针】交回 ReleaseStringUTFChars。
+     *   以前 mode 在回退时会指向静态数组 g_preferred_mode，却仍按"来自 JNI"去 Release ——
+     *   违反 JNI 规范，ART 上是未定义行为（偶发闪退）。所以另外存一份原始指针。 */
+    const char *devicePath_chars = devicePath_ ? (*env)->GetStringUTFChars(env, devicePath_, 0) : NULL;
+    const char *address_chars = address_ ? (*env)->GetStringUTFChars(env, address_, 0) : NULL;
+    const char *devicePath = devicePath_chars ? devicePath_chars : "";
+    const char *address = address_chars ? address_chars : "127.0.0.1";
     /* 取数方式用自检试出来的那个；没跑过自检就用默认 ISOC */
     const char *mode = NULL;
-    int mode_from_jni = 0;
-    if (mode_ != NULL) {
-        mode = (*env)->GetStringUTFChars(env, mode_, 0);
-        mode_from_jni = 1;
-    }
+    const char *mode_chars = NULL;
+    if (mode_ != NULL)
+        mode_chars = (*env)->GetStringUTFChars(env, mode_, 0);
+    mode = mode_chars;
     if (mode == NULL || (strcmp(mode, "BULK") != 0 && strcmp(mode, "ISOC") != 0))
         mode = g_preferred_mode;
     mirisdr_dev_t *dev = NULL;
@@ -1111,9 +1120,12 @@ err:
 
 rel_jni:
     (*env)->ReleaseStringUTFChars(env, devicePath_, devicePath);
-    (*env)->ReleaseStringUTFChars(env, address_, address);
-    if (mode_from_jni)
-        (*env)->ReleaseStringUTFChars(env, mode_, mode);
+    if (address_chars != NULL)
+        (*env)->ReleaseStringUTFChars(env, address_, address_chars);
+    if (devicePath_chars != NULL)
+        (*env)->ReleaseStringUTFChars(env, devicePath_, devicePath_chars);
+    if (mode_chars != NULL)
+        (*env)->ReleaseStringUTFChars(env, mode_, mode_chars);
     return ok;
 }
 

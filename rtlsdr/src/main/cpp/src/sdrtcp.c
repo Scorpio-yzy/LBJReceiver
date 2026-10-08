@@ -61,8 +61,14 @@ static void sdrtcp_cleanup(sdrtcp_t * obj) {
         LOGI("SdrTcp: Closing from state %d", obj->state);
 
         pool_free(&obj->workpool);
-        if (obj->state != STAGE_INITIALIZED && obj->listen_socket != -1) {
+        if (obj->listen_socket != -1) {
             close(obj->listen_socket);
+        }
+        /* ★ 客户端 socket 以前只置 -1、从不 close —— 每服务完一个客户端泄漏一个 fd，
+         *   反复连接最终 EMFILE，内置驱动再也起不来。 */
+        if (obj->client_socket != -1) {
+            shutdown(obj->client_socket, SHUT_RDWR);
+            close(obj->client_socket);
         }
 
         obj->client_socket = -1;
@@ -92,13 +98,15 @@ static void commandListener(void *arg) {
 
             if (obj->state == STAGE_CLIENT_SERVING && r) {
                 ssize_t received = recv(obj->client_socket, (char *) &cmd + (sizeof(cmd) - left), left, 0);
-                left -= received;
 
-                if (received == -1) {
-                    LOGI("SdrTcp: commandListener failed to receive command");
+                /* ★ received == 0 = 对端半关，必须当 EOF 处理；否则 select 一直可读、
+                 *   recv 一直返回 0、left 永不减 —— 命令线程 100% CPU 空转。 */
+                if (received <= 0) {
+                    LOGI("SdrTcp: commandListener 收到 EOF/错误（%d），收尾", (int) received);
                     obj->state = STAGE_NEEDS_STOPPING;
                     break;
                 }
+                left -= (size_t) received;
             }
         }
 
@@ -245,6 +253,7 @@ static void tcp_server(void *arg) {
     obj->closedcb(obj, obj->ctx);
 
     LOGI("SdrTcp: Server thread shut down");
+    obj->worker_done = 1;      /* 必须在 closedcb 之后 */
     pthread_exit(NULL);
 }
 
@@ -332,7 +341,10 @@ void sdrtcp_serve_client_async(sdrtcp_t * obj, void * ctx, sdrtcp_command_callba
 
     pthread_attr_t attrs;
     pthread_attr_init(&attrs);
-    pthread_attr_setdetachstate(&attrs, PTHREAD_CREATE_JOINABLE);
+    /* ★ 以前 JOINABLE 但句柄是局部变量、没人 join —— 每轮连接泄漏一个线程栈。
+     *   改 DETACHED，并加 worker_done 让 sdrtcp_free() 能等到线程真的走完再销毁结构。 */
+    pthread_attr_setdetachstate(&attrs, PTHREAD_CREATE_DETACHED);
+    obj->worker_done = 0;
     pthread_create(&worker_thread, &attrs, (void *) tcp_server, (void *) obj);
 }
 
@@ -378,13 +390,13 @@ int sdrtcp_feed(sdrtcp_t * obj, unsigned char  * buf, uint32_t len) {
                 succesful = 2;
             }
         } else if (obj->state == STAGE_SOCKET_OPEN || obj->state == STAGE_CLIENT_OPEN || obj->state == STAGE_CLIENT_OPEN_STARTED_ASYNC) {
-            usleep(FEED_SLEEP_IF_NOT_READY_MILLIS * 1000);
+            /* ★ 不能等：sdrtcp_feed 跑在 libusb 完成回调上，等 500ms 会把事件循环按住
+             *   （现象：启动后迟迟不出数据、取消也慢）。直接丢弃这一块。 */
             succesful = 2; // no client to send data to
         }
         pthread_mutex_unlock(&obj->state_locker);
     } else if (obj->state == STAGE_SOCKET_OPEN || obj->state == STAGE_CLIENT_OPEN || obj->state == STAGE_CLIENT_OPEN_STARTED_ASYNC) {
-        usleep(FEED_SLEEP_IF_NOT_READY_MILLIS * 1000);
-        succesful = 2; // no client to send data to
+        succesful = 2; // no client to send data to（同样不能等）
     }
 
     return succesful;
@@ -396,8 +408,17 @@ void sdrtcp_init(sdrtcp_t * obj) {
     obj->client_socket = -1;
     obj->listen_socket = -1;
     obj->dropped = 0;
+    obj->worker_done = 1;   /* 还没起服务线程 = 不需要等 */
 }
 
 void sdrtcp_free(sdrtcp_t * obj) {
+    /* ★ 先请服务线程收尾并等它真的退出（最多 2.5 秒），再销毁互斥量。
+     *   以前只 destroy：tcp_server/commandListener 可能还在跑，
+     *   之后 lock 一个已销毁的互斥量、访问已 free 的结构 —— 退出/重连随机崩。 */
+    sdrtcp_stop_serving_client(obj);
+    for (int i = 0; i < 250 && !obj->worker_done; i++)
+        usleep(10 * 1000);
+    if (!obj->worker_done)
+        LOGI("SdrTcp: 服务线程 2.5 秒内没退出，继续释放（可能留下一个悬空线程）");
     pthread_mutex_destroy(&obj->state_locker);
 }

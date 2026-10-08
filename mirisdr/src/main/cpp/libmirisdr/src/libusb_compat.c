@@ -85,8 +85,13 @@ int LIBUSB_CALL libusb_wrap_sys_device(libusb_context *ctx, intptr_t sys_dev,
     }
 
     int rc = libusb_open2(dev, dev_handle, myfd);
-    if (rc < 0)
+    if (rc < 0) {
+        /* ★ 失败时 libusb 的 op_open2 不会关 fd（成功路径才由 libusb_close 负责），
+         *   这里也不关就漏一个 fd。反复点"启动驱动"最终 fd 表耗尽，
+         *   之后连 socket/文件都开不了（连日志都写不出来，最难查）。 */
+        close(myfd);
         mirisdr_set_open_error("libusb_open2(fd=%d) 失败：code %d (%s)",
                                (int) sys_dev, rc, libusb_error_name(rc));
+    }
     return rc;
 }

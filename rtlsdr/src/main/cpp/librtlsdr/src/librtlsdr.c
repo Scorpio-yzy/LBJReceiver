@@ -2111,7 +2111,32 @@ int rtlsdr_open2(rtlsdr_dev_t **out_dev, int fd, const char * devicePath) {
 		goto err;
 	}
 
-	r = libusb_open2(device, &dev->devh, fd);
+	/* ★ fd 的所有者是 Java 侧的 UsbDeviceConnection（它自己也会在 finalize 时 close）。
+	 *   把同一个 fd 直接交给 libusb，两边都会 close 一次：
+	 *     ① GC/finalizer 先跑 -> 传输中 fd 被关，流随机断；
+	 *     ② libusb_close 先跑 -> fd 号被别的线程（Chaquopy/socket）复用，
+	 *        Java 侧再 close 一次就把别人的 fd 关掉 —— 最典型的"偶发且无法自愈"故障。
+	 *   dup 出来的 fd 指向同一个 open file description，所有 USBDEVFS ioctl 照常工作，
+	 *   而关闭责任分开了：libusb 关自己这份，Java 侧关它那份。
+	 *   （Mirics 模块的 libusb_compat.c 早就是这么做的，这边漏了。） */
+	int dupfd = dup(fd);
+	if (dupfd < 0) {
+		fprintf(stderr, "dup(fd=%d) failed\n", fd);
+		r = -1;
+		goto err;
+	}
+	r = libusb_open2(device, &dev->devh, dupfd);
+	if (r < 0)
+		close(dupfd);   /* 失败时 libusb 不会接管这个 fd */
+
+	/* ★ 上游 rtlsdr_open() 在这里判 r < 0 才继续；本移植漏了这个检查。
+	 *   open2 失败时不会写 *handle，dev->devh 还是 NULL，紧接着的
+	 *   libusb_kernel_driver_active(NULL) 会解引用空指针 —— 直接闪退。
+	 *   （libusb_open2 成功时才把 fd 的所有权交给 libusb，失败时 fd 仍归调用方。） */
+	if (r < 0 || dev->devh == NULL) {
+		fprintf(stderr, "libusb_open2 failed: %d\n", r);
+		goto err;
+	}
 
 	if (libusb_kernel_driver_active(dev->devh, 0) == 1) {
 		dev->driver_active = 1;
@@ -2155,7 +2180,15 @@ int rtlsdr_open2(rtlsdr_dev_t **out_dev, int fd, const char * devicePath) {
 	 * Instead grab them directly from the EEPROM
 	 * */
 
+	/* ★ buf 是栈上未初始化的数组。读 EEPROM 失败时必须清零再往下走：
+	 *   否则 rtlsdr_check_dongle_model() 用垃圾字符串判机型、
+	 *   force_bt 由随机位决定（误开/误关偏置供电），
+	 *   get_string_descriptor 还会按垃圾长度做越界读。 */
 	r = rtlsdr_read_eeprom(dev, buf, 0, EEPROM_SIZE);
+	if (r < 0) {
+		fprintf(stderr, "rtlsdr_read_eeprom failed: %d\n", r);
+		memset(buf, 0, sizeof(buf));
+	}
 	pos = get_string_descriptor(STR_OFFSET, buf, dev->manufact);
 	get_string_descriptor(pos, buf, dev->product);
 

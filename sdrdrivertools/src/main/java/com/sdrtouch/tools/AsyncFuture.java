@@ -57,15 +57,23 @@ public class AsyncFuture<V> implements Future<V> {
     @Override
     public V get() throws InterruptedException, ExecutionException {
         synchronized (locker) {
-            locker.wait();
+            // ★ 必须循环判 ready：USB 授权广播可能在调用方进入 get() 之前就已经 setDone()
+            //   （用户点"允许"很快），那时 wait() 等的是下一次永远不会来的 notify ——
+            //   打开线程永久卡住，权限接收器也一直挂着（现象：点启动后一直转圈）。
+            while (!ready) locker.wait();
             return object;
         }
     }
 
     @Override
     public V get(long timeout, @NonNull TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException {
+        long deadline = System.currentTimeMillis() + unit.toMillis(timeout);
         synchronized (locker) {
-            locker.wait(unit.toMillis(timeout));
+            while (!ready) {
+                long left = deadline - System.currentTimeMillis();
+                if (left <= 0) throw new TimeoutException("AsyncFuture 等待超时");
+                locker.wait(left);
+            }
             return object;
         }
     }
