@@ -471,6 +471,12 @@ class TripLog:
             except Exception as e:
                 self._err = '读历史失败 %s: %s' % (date, e)
                 trips = []
+                # ★ 记下"这天文件是坏的"：否则 _write_day 看到 trips 为空会把它 os.remove 掉，
+                #   用户就失去了唯一能人工抢救的原始数据（解析失败往往只是某一条记录有问题）。
+                corrupt = getattr(self, '_corrupt', None)
+                if corrupt is None:
+                    self._corrupt = corrupt = set()
+                corrupt.add(date)
         self._days[date] = trips
         return trips
 
@@ -481,7 +487,11 @@ class TripLog:
         tmp = self._path(date) + '.tmp'
         try:
             if not trips:
-                # 空的一天：留着空文件没意义，直接删掉
+                # 空的一天：留着空文件没意义，直接删掉。
+                # ★ 但"读坏的那天"绝不能删（见 _load）：那会把用户唯一能抢救的原始数据抹掉。
+                if date in getattr(self, '_corrupt', ()):
+                    self._err = '历史文件 %s 读取失败，已保留原文件不覆盖' % date
+                    return False
                 if os.path.isfile(self._path(date)):
                     os.remove(self._path(date))
                 return True

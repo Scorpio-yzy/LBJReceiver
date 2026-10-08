@@ -87,10 +87,16 @@ static uint8_t *samples_realloc(mirisdr_dev_t *p, int size)
 {
     if(p->samples_size < size)
     {
-        if(p->samples)
+        /* ★ 不能用 realloc 的返回值直接盖掉旧指针、也不能在失败时把 size 改成新值：
+         *   malloc 失败时返回 NULL，而调用方会把它当 dst 传给转换器 → memcpy 写 NULL（必崩）；
+         *   顺便旧缓冲也被 free 掉了，等于连降级都没有。 */
+        uint8_t *np = (uint8_t *) malloc(size);
+        if (np == NULL)
+            return NULL;                 /* 调用方按 NULL 跳过本次回调 */
+        if (p->samples)
             free(p->samples);
-        p->samples=malloc(size);
-        p->samples_size=size;
+        p->samples = np;
+        p->samples_size = size;
     }
     return p->samples;
 }
@@ -281,6 +287,21 @@ int mirisdr_cancel_async_now (mirisdr_dev_t *p) {
 #else
     usleep(20000);
 #endif
+
+    /* ★ 再等【读线程真的退出】：INACTIVE 是在读线程做 mirisdr_async_free()/
+     *   mirisdr_streaming_stop() 之前置好的，只等状态的话调用方会在这两件事还没做完时
+     *   free(p) —— use-after-free。有界等待（最多 2 秒），超时只记日志，不永久卡住调用方。 */
+    {
+        int rd;
+        for (rd = 0; rd < 200 && !p->reader_done; rd++)
+#if defined (_WIN32) && !defined(__MINGW32__)
+            Sleep(10);
+#else
+            usleep(10 * 1000);
+#endif
+        if (!p->reader_done)
+            fprintf(stderr, "libmirisdr: reader thread did not finish in 2s\n");
+    }
 
 done:
     return 0;
@@ -475,6 +496,11 @@ int mirisdr_read_async (mirisdr_dev_t *p, mirisdr_read_async_cb_t cb, void *ctx,
     /* spustíme streamování dat */
     mirisdr_streaming_start(p);
 
+    /* ★ 从这一刻起读线程会一直用 p（退出时还要 async_free/streaming_stop）。
+     *   mirisdr_cancel_async_now 只看 async_status 不够：那个 INACTIVE 是在真正收尾
+     *   【之前】置的，于是 mirisdr_close 会在读线程还在用 p 时 release/close/exit/free
+     *   —— use-after-free（真机现象：停止后再启动随机崩）。 */
+    p->reader_done = 0;
     p->async_status = MIRISDR_ASYNC_RUNNING;
 
     while (p->async_status != MIRISDR_ASYNC_INACTIVE) {
@@ -502,6 +528,7 @@ int mirisdr_read_async (mirisdr_dev_t *p, mirisdr_read_async_cb_t cb, void *ctx,
                 fprintf(stderr, "libmirisdr: transfers would not cancel, "
                                 "abandoning them\n");
                 p->async_status = MIRISDR_ASYNC_INACTIVE;
+                p->reader_done = 1;      /* 放弃这些 transfer：本线程不再碰 p */
                 return -1;
             }
 
@@ -547,6 +574,7 @@ int mirisdr_read_async (mirisdr_dev_t *p, mirisdr_read_async_cb_t cb, void *ctx,
 #endif
     mirisdr_streaming_stop(p);
     /* je vhodné ukončit i adc, jenže pak by při dalším otevření bylo nutné provést inicializaci */
+    p->reader_done = 1;              /* ★ 本线程彻底用完了 p（取消方在等这个） */
 
     if (transfer_failed) {
         p->async_status = MIRISDR_ASYNC_INACTIVE;
@@ -557,8 +585,10 @@ int mirisdr_read_async (mirisdr_dev_t *p, mirisdr_read_async_cb_t cb, void *ctx,
 
 failed_free:
     mirisdr_async_free(p);
+    p->reader_done = 1;
 
 failed:
+    p->reader_done = 1;              /* 走到这里读线程也不会再用 p 了 */
     return -1;
 }
 

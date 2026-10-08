@@ -13,7 +13,7 @@ SET ( SOURCES_LIB
     "${CMAKE_CURRENT_SOURCE_DIR}/libmirisdr/src/libmirisdr.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/libmirisdr/src/libusb_compat.c" )
 
-SET ( CMAKE_C_FLAGS         "-Wall" )
+SET ( CMAKE_C_FLAGS         "${CMAKE_C_FLAGS} -Wall" )   # ★ 追加而不是覆盖：覆盖会丢掉 toolchain 默认的加固 flags（-fstack-protector 等）
 SET ( CMAKE_C_FLAGS_DEBUG   "-g -DDEBUG" )
 SET ( CMAKE_C_FLAGS_RELEASE "-O2 -DNDEBUG" )
 

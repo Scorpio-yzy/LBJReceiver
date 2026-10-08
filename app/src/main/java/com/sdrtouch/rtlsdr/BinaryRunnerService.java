@@ -69,8 +69,9 @@ public class BinaryRunnerService extends Service {
 	private PowerManager.WakeLock wl = null;
 
 	private final IBinder mBinder = new LocalBinder();
-	private boolean isRunning = false;
-	private SdrDevice thisSdrDevice = null;
+	// 都是"跨线程读写"（服务线程 onClosed 写、Binder/主线程读），必须 volatile
+	private volatile boolean isRunning = false;
+	private volatile SdrDevice thisSdrDevice = null;
 	private final Set<StatusCallback> statusCallbacks = new HashSet<>();
 	private final Queue<Pair<SdrDevice, SdrTcpArguments>> workQueue = new LinkedList<>();
 
@@ -235,9 +236,17 @@ public class BinaryRunnerService extends Service {
 	}
 
 	public void closeService() {
-		if (isRunning) {
+		// ★ 两个字段分开判断：onClosed 回调里是【先】thisSdrDevice = null、【后】announceNotRunning()
+		//   清 isRunning，这中间从别的线程（LocalBinder.startWithDevice 那条路没有 try/catch）
+		//   进来就会 NPE。这里用局部变量 + 判空，并且只在确实拿到设备时才 close。
+		SdrDevice dev = thisSdrDevice;
+		if (isRunning && dev != null) {
 			Log.appendLine("Closing device");
-			thisSdrDevice.close();
+			try {
+				dev.close();
+			} catch (Throwable e) {
+				Log.appendLine("close device failed: " + e);
+			}
 		}
 	}
 

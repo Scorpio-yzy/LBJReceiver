@@ -157,6 +157,18 @@ static int miri_plan_rate(uint32_t client_rate, int *decim)
         client_rate = MIRI_DEFAULT_RATE;
     while ((uint64_t) client_rate * (uint64_t) k < MIRI_HW_RATE_MIN)
         k++;
+    /* ★ 只实现了 1 倍和 2 倍抽取（miri_read_cb 里只有 decim==2 那条真抽取）。
+     *   以前对 k>=3 的请求（比如客户端要 480k）会把硬件设成 client*k 却把 decim 记成 1，
+     *   客户端于是拿到 k 倍的字节率、DSP 全按错的速率跑。
+     *   这里把不支持的速率就近吸附到"硬件下限的一半"（=650k，正好 2 倍抽取），
+     *   并在日志里说清楚 —— 宁可给一个诚实的速率，也不要"设了不抽"。 */
+    if (k > 2) {
+        uint32_t fixed = (uint32_t) (MIRI_HW_RATE_MIN / 2);
+        MIRI_LOGE("客户端要 %u S/s 需要 %d 倍抽取（未实现），就近按 %u S/s ×2 处理",
+                  (unsigned) client_rate, k, (unsigned) fixed);
+        client_rate = fixed;
+        k = 2;
+    }
     *decim = k;
     return (int) ((uint64_t) client_rate * (uint64_t) k);
 }
@@ -463,6 +475,13 @@ static void miri_stream_test(mirisdr_dev_t *dev, const char *mode, int ms,
 
     pthread_t wd;
     int has_wd = (pthread_create(&wd, NULL, miri_stream_watchdog, &s) == 0);
+    if (!has_wd) {
+        /* 没有看门狗时，设备一个字节都不给就会让 mirisdr_read_async 永久阻塞 ——
+         * 自检会卡死在一个转圈的对话框上（用户只能强杀 App）。宁可不测。 */
+        MIRI_LOGE("看门狗线程创建失败，跳过本次真收数据测试");
+        out->started = -101;
+        return;
+    }
     int r = mirisdr_read_async(dev, miri_stream_probe_cb, &s, 0, 0);
     s.done = 1;
     if (has_wd)
@@ -546,8 +565,15 @@ static void miri_closed_cb(sdrtcp_t *tcp, void *ctx)
 {
     miri_device_t *d = (miri_device_t *) ctx;
     (void) tcp;
-    if (d != NULL && d->dev != NULL)
+    if (d == NULL)
+        return;
+    /* ★ 必须持 d->lock：releaseUsb/close 是"mirisdr_close(dev) 之后才把 d->dev 置 NULL"，
+     *   无锁读会在那个窗口拿到已经释放的指针，随后 mirisdr_cancel_async(已释放) ——
+     *   客户端断开与释放并发时就会踩。 */
+    pthread_mutex_lock(&d->lock);
+    if (d->dev != NULL)
         mirisdr_cancel_async(d->dev);
+    pthread_mutex_unlock(&d->lock);
 }
 
 static void miri_command_cb(sdrtcp_t *tcp, void *ctx, sdr_tcp_command_t *cmd)
@@ -860,18 +886,21 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jlon
      * 会自己显形）。
      */
     miri_stream_result_t bw_wide, bw_narrow;
-    /* 带宽枚举值：200K=0 300K=1 600K=2 1536K=3 5M=4 6M=5 7M=6 8M=7（见 libmirisdr 的 structs.h） */
-    mirisdr_set_bandwidth(dev, 7);
+    /* ★ mirisdr_set_bandwidth() 收的是【Hz】，不是枚举下标！
+     *   以前这里传 7 / 3，函数里 if (bw <= 8000000) ... if (bw <= 200000) 两条都命中 →
+     *   两次都设成 200kHz，报告里"8MHz vs 1.5MHz"其实是"200kHz vs 200kHz"，
+     *   据此得出的"带宽宽窄没差别"结论作废。 */
+    mirisdr_set_bandwidth(dev, 8000000);
     mirisdr_set_sample_rate(dev, (uint32_t) hw_rate);
     mirisdr_set_center_freq(dev, probe_freq);
     mirisdr_set_tuner_gain(dev, 90);
     miri_stream_test(dev, g_preferred_mode, 600, &bw_wide);
-    mirisdr_set_bandwidth(dev, 3);
+    mirisdr_set_bandwidth(dev, 1536000);
     mirisdr_set_sample_rate(dev, (uint32_t) hw_rate);
     mirisdr_set_center_freq(dev, probe_freq);
     mirisdr_set_tuner_gain(dev, 90);
     miri_stream_test(dev, g_preferred_mode, 600, &bw_narrow);
-    mirisdr_set_bandwidth(dev, 7);                    /* 恢复默认，不改用户行为 */
+    mirisdr_set_bandwidth(dev, 8000000);              /* 恢复默认（Hz！），不改用户行为 */
     miri_trace(tracePath, "15 带宽对比：8MHz 峰值=%d 平均|x|=%d‰ / 1.5MHz 峰值=%d 平均|x|=%d‰",
                bw_wide.peak_abs, bw_wide.mean_abs_milli, bw_narrow.peak_abs, bw_narrow.mean_abs_milli);
 
@@ -884,6 +913,11 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_probe(JNIEnv *env, jobject thiz, jlon
 
     n += snprintf(msg + n, miri_left(n, sizeof(msg)),
                   "\n控制传输：写寄存器 %d，开始串流 %d（0 = 正常，负数 = 设备没在听）\n", ct, cs);
+    /* ★ Mirics 侧的 PPM 是空实现（libmirisdr 的 mirisdr_set_xtal_freq 直接 return -1）。
+     *   设置里那个 PPM 对 RSP1 完全无效 —— 必须写在屏幕上，否则用户按收音机的习惯去校
+     *   PPM，只会以为"校了没用"。 */
+    n += snprintf(msg + n, miri_left(n, sizeof(msg)),
+                  "PPM 校正：Mirics 侧【未实现】，设置里的 PPM 对 RSP1 不生效\n");
     n += snprintf(msg + n, miri_left(n, sizeof(msg)),
                   "带宽对比（增益都用 90 dB）：8MHz 峰值 %d 平均|x| %d / 1.5MHz 峰值 %d 平均|x| %d\n",
                   bw_wide.peak_abs, bw_wide.mean_abs_milli,
@@ -1094,32 +1128,46 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_openAsync(
 
     sdrtcp_serve_client_async(&d->tcp, (void *) d, miri_command_cb, miri_closed_cb);
 
-    if (mirisdr_read_async(dev, miri_read_cb, (void *) d, 0, 0) != 0) {
-        MIRI_LOGE("启动异步读失败");
-        goto err;
-    }
+    /* ★ 顺序要紧：mirisdr_read_async 是【阻塞】的（只有流被取消/出错才返回）。
+     *   原来 streaming=1 与 announceOnOpen 都写在它【之后】——
+     *   等于"流都结束了才回调、才标记在跑"：Java 侧状态机错乱、
+     *   d->streaming 永远是个错的值，而且读循环正常返回后这里什么都不做，
+     *   USB 接口与监听端口要等 Java 显式 stop/close 才释放（Java 却以为一切正常）。 */
     d->streaming = 1;
-    MIRI_LOGI("开始串流");
-
     ok = JNI_TRUE;
+    MIRI_LOGI("开始串流");
     if (announceOnOpen != NULL)
         (*env)->CallVoidMethod(env, thiz, announceOnOpen);
-    goto rel_jni;
+
+    if (mirisdr_read_async(dev, miri_read_cb, (void *) d, 0, 0) != 0) {
+        MIRI_LOGE("异步读返回错误");
+        ok = JNI_FALSE;
+    }
+    /* 读循环返回 = 流已经停了：在这里把设备与端口都收干净，
+     * 别把"占着 USB 已死连接"的状态留给 Java（症状是"界面还在接收但什么也没有"）。 */
+    MIRI_LOGI("串流已结束，开始收尾");
+    d->streaming = 0;
+    goto err;
 
 err:
+    /* ★ 顺序：先把 d->dev 置 NULL（worker 的 closed_cb/command_cb 持锁读它），
+     *   再 mirisdr_close —— 反过来的话回调会在那个窗口拿到已释放的指针。 */
+    pthread_mutex_lock(&d->lock);
+    d->dev = NULL;
+    pthread_mutex_unlock(&d->lock);
     if (dev != NULL) {
         mirisdr_close(dev);
         dev = NULL;
     }
-    /* 失败也要把监听 socket 收掉：sdrtcp 的 listen socket 只有 stop/free 会关，
-     * 不收的话端口一直占着，用户再点一次【启动驱动】必然绑不上（"驱动没起来"）。 */
+    /* 失败/结束都要把监听 socket 收掉：sdrtcp 的 listen socket 只有 stop/free 会关，
+     * 不收的话端口一直占着，用户再点一次【启动驱动】必然绑不上（"驱动没起来"）。
+     * ★ stop 在"正在服务"时是异步收尾：这里等它真的关掉（最多 1.2 秒），
+     *   否则随后立刻重试 openAsync 会因为 state 还没回 UNINITIALIZED 直接失败。 */
     sdrtcp_stop_serving_client(&d->tcp);
-    pthread_mutex_lock(&d->lock);
-    d->dev = NULL;
-    pthread_mutex_unlock(&d->lock);
+    for (int w = 0; w < 120 && d->tcp.listen_socket != -1; w++)
+        usleep(10 * 1000);
 
 rel_jni:
-    (*env)->ReleaseStringUTFChars(env, devicePath_, devicePath);
     if (address_chars != NULL)
         (*env)->ReleaseStringUTFChars(env, address_, address_chars);
     if (devicePath_chars != NULL)
@@ -1270,7 +1318,16 @@ Java_com_railfan_lbj_mirisdr_MiriSdrDevice_getSupportedCommands(JNIEnv *env, job
     (void) thiz;
     int len = (int) (sizeof(SUPPORTED_COMMANDS) / sizeof(SUPPORTED_COMMANDS[0]));
     jclass stringClass = (*env)->FindClass(env, "java/lang/String");
+    if (stringClass == NULL) {
+        /* 类加载器里找不到 String（极罕见）时直接返回空数组，不要带着 NULL class 往下走 */
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        return NULL;
+    }
     jobjectArray arr = (*env)->NewObjectArray(env, len, stringClass, NULL);
+    if (arr == NULL) {
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        return NULL;
+    }
     for (int i = 0; i < len; i++) {
         char buf[16];
         snprintf(buf, sizeof(buf), "%d", (int) SUPPORTED_COMMANDS[i]);

@@ -349,18 +349,27 @@ void sdrtcp_serve_client_async(sdrtcp_t * obj, void * ctx, sdrtcp_command_callba
 }
 
 void sdrtcp_stop_serving_client(sdrtcp_t * obj) {
-
-    if (obj->state == STAGE_UNINITIALIZED) {
+    /* ★ state 的读改写必须持 state_locker：tcp_server 那边也是持锁把 state 置成
+     *   STAGE_CLIENT_SERVING 的。不加锁时存在这种时序：
+     *   stop 读到旧 state → 走 cleanup（pool_free、state 打回 UNINITIALIZED），
+     *   紧接着 tcp_server 又把 state 写成 SERVING 并进 serveClient ——
+     *   此时 workpool 已 free，pool_get 永远返回 NULL，serveClient 变成 100% CPU 死循环，
+     *   而且这条服务线程再也退不出来（下一次启动就绑不上端口）。 */
+    pthread_mutex_lock(&obj->state_locker);
+    int st = obj->state;
+    if (st == STAGE_UNINITIALIZED) {
+        pthread_mutex_unlock(&obj->state_locker);
         LOGI("SdrTcp: Requested sdrtcp stop but already stopped");
         return;
     }
-
-    if (obj->state < STAGE_CLIENT_OPEN_STARTED_ASYNC) {
+    if (st < STAGE_CLIENT_OPEN_STARTED_ASYNC) {
+        pthread_mutex_unlock(&obj->state_locker);
         LOGI("SdrTcp: Requested sdrtcp stop and stopping now");
-        sdrtcp_cleanup(obj);
+        sdrtcp_cleanup(obj);        /* 它自己会加锁 */
     } else {
-        LOGI("SdrTcp: Requested sdrtcp stop asynchroneously");
         obj->state = STAGE_NEEDS_STOPPING;
+        pthread_mutex_unlock(&obj->state_locker);
+        LOGI("SdrTcp: Requested sdrtcp stop asynchroneously");
     }
 }
 

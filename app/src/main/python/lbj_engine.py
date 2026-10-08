@@ -633,11 +633,12 @@ class LbjEngine:
             # 没收到数据、但也没报错，且已经过了 settle_s —— 认为已连上。
             # settle_s 必须大于"连接被拒"的返回时间，否则会把失败误判成成功。
             # 本机 loopback 上是瞬间返回的；Windows 上实测最长 2.1 秒，所以短试取 2.5 秒。
-            if not self._src._error and (time.time() - attempt_start) >= settle_s:
-                self._err = ''          # 同上：连上了就清掉旧的失败信息
-                self._opened = True
-                print('LBJ: 已连接（%.1f 秒内未出现错误），暂时没有数据' % settle_s, flush=True)
-                return True
+            # ★ 这里【不能】"没数据也算成功"。
+            #   数据源的 socket 超时是 8 秒，而本函数的探测窗口也是 8 秒（settle_s=6）——
+            #   半死的驱动（发了握手、之后不推数据）要到 8 秒才置 error，永远赶不上这个分支，
+            #   于是被判定为"已连上"：App 以为驱动在跑、不去重启它，
+            #   DSP 线程随后 read() 超时报错退出，用户看到"接收中"后莫名报错、只能重来。
+            #   唯一不会骗人的信号是【队列里真的收到数据】（见上面的注释）。
             if not self._src._error:
                 self._src._error = '等待连接结果超时'
             msg = str(self._src._error)

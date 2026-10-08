@@ -103,6 +103,9 @@ struct mirisdr_dev {
     uint8_t             *samples;
     int                 samples_size;
     int                 sync_loss_cnt;
+    /* ★ 本项目新增：读线程是否已彻底退出（连 async_free/streaming_stop 都做完了）。
+     *   mirisdr_cancel_async_now / mirisdr_close 靠它判断"现在 free(p) 安全不安全"。 */
+    volatile int        reader_done;
     /* ★ 本项目新增（Android）：504 帧重组 + ISOC 拼包。
      * 走 ISOC 时每个回调只给"一个微帧有多少"（1.92 MS/s 下才几百字节），
      * 一帧 1024 字节必然被切开；而且包在 URB 缓冲里是按"请求长度"留间隔的，

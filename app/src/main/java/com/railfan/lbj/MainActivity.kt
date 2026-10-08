@@ -236,6 +236,9 @@ private const val FULL_STOP_DELAY_MS = 120000L
     private var scanAdapter: ScanAdapter? = null
     private var scanResults: JSONArray = JSONArray()
     private var scanActive = false
+    // ★ 扫描"已经请求、但引擎还没把 active 置真"的那一小段：
+    //   这段时间轮询拿到 active=false，不能当成"扫描已结束"（见 renderScan）。
+    @Volatile private var scanStarting = false
     private var scanFine = true
     private var scanMargin = 7.0        // 门限余量（dB，相对底噪）；扫描中也能改
     private var scanModeBtn: Button? = null
@@ -1316,10 +1319,20 @@ private const val FULL_STOP_DELAY_MS = 120000L
     }
 
     /** 后台安全调用收音机引擎的方法（绝不在主线程调 Python） */
+    /**
+     * 往收音机引擎发一个参数（音量/静噪等）。
+     *
+     * ★ 带"在途就丢弃"节流：拖动滑条时 onProgressChanged 每帧都触发，
+     *   原来是每次新建一个线程去调 Python —— 瞬间几十个线程抢同一个引擎对象，
+     *   既不必要也把并发面暴露给 Python 侧。滑条只关心最后停在哪，中间值丢掉无妨。
+     */
+    private val radioCall2Busy = java.util.concurrent.atomic.AtomicBoolean(false)
+
     private fun radioCall2(name: String, arg: Any) {
         val re = radioEngine ?: return
+        if (!radioCall2Busy.compareAndSet(false, true)) return
         Thread {
-            try { re.callAttr(name, arg) } catch (_: Throwable) { }
+            try { re.callAttr(name, arg) } catch (_: Throwable) { } finally { radioCall2Busy.set(false) }
         }.start()
     }
 
@@ -1337,6 +1350,15 @@ private const val FULL_STOP_DELAY_MS = 120000L
         val connected = if (eng == null) false
                         else try { eng.callAttr("is_connected").toBoolean() } catch (_: Throwable) { false }
         if (eng == null || !connected) {
+            // ★ 注意 startEngine() 第一行是 if (busy || running) return ——
+            //   如果界面还认为 running=true（连接刚坏、快照还没翻），这里就会【立刻返回】，
+            //   pendingRadio 留在 true：用户之后正常"停止→开始"时会突然被切进收音机。
+            //   所以这种"有引擎但连接已坏"的情况直接清掉挂起意图，并提示重来。
+            if (running) {
+                pendingRadio = false
+                toast("数据源连接已失效，请先【停止】再重新【开始接收】")
+                return
+            }
             pendingRadio = true
             startEngine()
             return
@@ -1536,6 +1558,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
         val res = sc.optJSONArray("results") ?: JSONArray()
         val act = sc.optBoolean("active", false)
         if (act) {
+            scanStarting = false   /* 引擎确认在扫了 */
             val ph = when (sc.optString("phase", "")) {
                 "verify" -> "复核信号"
                 "window", "discard", "measure" -> "扫描中"
@@ -1550,8 +1573,11 @@ private const val FULL_STOP_DELAY_MS = 120000L
                 ph, sc.optInt("pass", 0) + 1, fmtMhz(sc.optDouble("cur_hz", radioFreqHz)),
                 scanRangeText(sc), fTxt, tTxt, mTxt, res.length()
             )
-        } else if (scanActive) {
-            // 引擎那边刚结束
+        } else if (scanActive && !scanStarting) {
+            // 引擎那边刚结束。
+            // ★ scanStarting 是在 start_scan 真正生效之前的那段时间：
+            //   引擎还没把 active 置真，轮询拿到 false 会把"刚启动"当成"已结束"
+            //   （按钮变"再扫一趟"、还可能误报"没扫到信号"），所以这段时间不判结束。
             scanActive = false
             radioScan = false
             updateRadioButtons()
@@ -2260,6 +2286,7 @@ private const val FULL_STOP_DELAY_MS = 120000L
         scanMargin = marginDb
         scanResults = JSONArray()
         scanActive = true
+        scanStarting = true      /* 引擎把 active 置真之前，轮询不许判"已结束" */
         radioScan = true
         updateRadioButtons()
         showScanDialog()
@@ -3447,7 +3474,11 @@ private const val FULL_STOP_DELAY_MS = 120000L
                             "其它 SDR/电视 App 没退干净，或内核 DVB 驱动（msi2500/msi001）。\n" +
                             "① 从最近任务里划掉本 App 再进；② 清掉其它 SDR App；③ 拔了重插再自检。"
                          else ""))
-                    .setPositiveButton("启动驱动") { _, _ -> rsp1Start(usb, dev) }
+                    // ★ 驱动本来就在跑时，下面会自动把它起回来 —— 这时再给"启动驱动"按钮，
+                    //   用户点一下会再 openDevice 一次（先开新连接再关旧连接），白白打扰在跑的实例。
+                    .setPositiveButton(if (wasRunning) "知道了" else "启动驱动") { _, _ ->
+                        if (!wasRunning) rsp1Start(usb, dev)
+                    }
                     .setNegativeButton("关闭", null)
                     .showSafe()
                 if (wasRunning) {

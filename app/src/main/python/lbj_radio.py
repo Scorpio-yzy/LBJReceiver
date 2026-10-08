@@ -358,6 +358,11 @@ class RadioEngine:
         if m in MODES and m != self._mode:
             self._mode = m
             self._reset_dsp()
+            # ★ 制式一变，噪声带宽就变了（WFM 200k vs NFM 12.5k），RSSI 基线整个平移：
+            #   底噪必须重新学习，否则静噪会被卡在"永久打开"的状态（持续嘶嘶）。
+            self._floor = None
+            self._learn_until = self._elapsed + 0.5
+            self._mute_until = self._elapsed + 0.2
             print('LBJ: 收音机解调方式 → %s' % m, flush=True)
 
     def set_step(self, hz):
@@ -381,6 +386,13 @@ class RadioEngine:
 
     def set_tuner(self, name):
         """记录调谐器型号 —— 决定增益用哪张档位表（'OTHER' = RSP1 这类网络源，直通）。"""
+        # ★ 增益/制式/调谐器一变，RSSI 基线整体平移：底噪必须重新学习。
+        #   底噪只在"静噪关着"时更新（见 _tick 里的注释），而调高增益后静噪会一直开着，
+        #   底噪于是再也不更新 → 门限永远被超过 → 喇叭持续嘶嘶，只能换频/重进收音机。
+        self._floor = None
+        self._learn_until = self._elapsed + 0.5
+        self._mute_until = self._elapsed + 0.2
+
         self._tuner = str(name or 'R820T')
         return self._tuner
 
@@ -402,6 +414,13 @@ class RadioEngine:
 
     def set_gain(self, db):
         """设增益。返回吸附后的实际值（界面显示用）。"""
+        # ★ 增益/制式/调谐器一变，RSSI 基线整体平移：底噪必须重新学习。
+        #   底噪只在"静噪关着"时更新（见 _tick 里的注释），而调高增益后静噪会一直开着，
+        #   底噪于是再也不更新 → 门限永远被超过 → 喇叭持续嘶嘶，只能换频/重进收音机。
+        self._floor = None
+        self._learn_until = self._elapsed + 0.5
+        self._mute_until = self._elapsed + 0.2
+
         self._gain_db = lbj_engine.snap_gain(self._tuner, db)
         R._g2['gain'] = self._gain_db      # 预警器重连时会用这个值重新下发
         self.gain_apply()
@@ -1146,9 +1165,15 @@ class RadioEngine:
             if s.get('keep_hz'):
                 # 用户在列表里点了"设为当前频率"：听他的，别自作主张停在最强信号上
                 self.set_frequency(s['keep_hz'])
+                for it in res:
+                    if abs(float(it.get('freq') or 0) - float(s['keep_hz'])) < 1.0:
+                        it['cur'] = True
             elif res:
                 best = max(res, key=lambda r: r.get('db') or -999)
                 self.set_frequency(best['freq'])       # 停在最强那个信号上
+                # ★ "当前收听"标记：Kotlin 的扫描结果表用它显示"（当前收听）"，
+                #   以前全代码没有一处置 True，这个标记永远不会出现。
+                best['cur'] = True
             else:
                 self.set_frequency(s['start_hz'])
             print('LBJ: 扫描结束（扫了 %d 趟），共 %d 个信号'
@@ -1485,6 +1510,9 @@ class RadioEngine:
         thr = floor + margin
         s['floor'] = round(floor, 1)
         s['thr'] = round(thr, 1)
+        # ★ 自动门限算出的 margin 也要写回：_scan_snapshot 发的是 s.get('margin')，
+        #   不写的话界面永远显示不出"（底噪+X）"。
+        s['margin'] = round(float(margin), 1)
 
         hits = []
         cur = None

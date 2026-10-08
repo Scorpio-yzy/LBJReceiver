@@ -6,7 +6,7 @@ ADD_SUBDIRECTORY(libusb)
 
 FILE ( GLOB_RECURSE SOURCES_LIB "src/*.c" )
 
-SET ( CMAKE_C_FLAGS         "-Wall" )
+SET ( CMAKE_C_FLAGS         "${CMAKE_C_FLAGS} -Wall" )   # ★ 追加而非覆盖（覆盖会丢 toolchain 的加固 flags）
 SET ( CMAKE_C_FLAGS_DEBUG   "-g -DDEBUG")
 SET ( CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG" )
 

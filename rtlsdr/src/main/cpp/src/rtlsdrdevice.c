@@ -23,6 +23,7 @@
 #include "common.h"
 #include "rtl-sdr-android.h"
 #include "sdrtcp.h"
+#include <unistd.h>          /* usleep：等 sdrtcp 服务线程收尾时用 */
 #include "SdrException.h"
 #include "tcp_commands.h"
 #include "rtlsdr_i2c.h"
@@ -112,38 +113,38 @@ void tcpCommandCallback(sdrtcp_t * tcpserv, void * pointer, sdr_tcp_command_t * 
             rtlsdr_set_center_freq(dev->rtl_dev,cmd->parameter);
             break;
         case TCP_SET_SAMPLE_RATE:
-            LOGI("set sample rate %ld", cmd->parameter);
+            LOGI("set sample rate %u", (unsigned) cmd->parameter);
             rtlsdr_set_sample_rate(dev->rtl_dev, cmd->parameter);
             break;
         case TCP_SET_GAIN_MODE:
-            LOGI("set gain mode %ld", cmd->parameter);
+            LOGI("set gain mode %u", (unsigned) cmd->parameter);
             rtlsdr_set_tuner_gain_mode(dev->rtl_dev, cmd->parameter);
             break;
         case TCP_SET_GAIN:
-            LOGI("set gain %ld", cmd->parameter);
+            LOGI("set gain %u", (unsigned) cmd->parameter);
             rtlsdr_set_tuner_gain(dev->rtl_dev, cmd->parameter);
             break;
         case TCP_SET_FREQ_CORRECTION:
-            LOGI("set freq correction %ld", cmd->parameter);
+            LOGI("set freq correction %u", (unsigned) cmd->parameter);
             rtlsdr_set_freq_correction(dev->rtl_dev, cmd->parameter);
             break;
         case TCP_SET_IF_TUNER_GAIN:
             rtlsdr_set_tuner_if_gain(dev->rtl_dev, cmd->parameter >> 16, (short)(cmd->parameter & 0xffff));
             break;
         case TCP_SET_TEST_MODE:
-            LOGI("set test mode %ld", cmd->parameter);
+            LOGI("set test mode %u", (unsigned) cmd->parameter);
             rtlsdr_set_testmode(dev->rtl_dev, cmd->parameter);
             break;
         case TCP_SET_AGC_MODE:
-            LOGI("set agc mode %ld", cmd->parameter);
+            LOGI("set agc mode %u", (unsigned) cmd->parameter);
             rtlsdr_set_agc_mode(dev->rtl_dev, cmd->parameter);
             break;
         case TCP_SET_DIRECT_SAMPLING:
-            LOGI("set direct sampling %ld", cmd->parameter);
+            LOGI("set direct sampling %u", (unsigned) cmd->parameter);
             rtlsdr_set_direct_sampling(dev->rtl_dev, cmd->parameter);
             break;
         case TCP_SET_OFFSET_TUNING:
-            LOGI("set offset tuning %ld", cmd->parameter);
+            LOGI("set offset tuning %u", (unsigned) cmd->parameter);
             rtlsdr_set_offset_tuning(dev->rtl_dev, cmd->parameter);
             break;
         case TCP_SET_RTL_XTAL:
@@ -151,7 +152,7 @@ void tcpCommandCallback(sdrtcp_t * tcpserv, void * pointer, sdr_tcp_command_t * 
             rtlsdr_set_xtal_freq(dev->rtl_dev, cmd->parameter, 0);
             break;
         case TCP_SET_TUNER_XTAL:
-            LOGI("set tuner xtal %dl", cmd->parameter);
+            LOGI("set tuner xtal %u", (unsigned) cmd->parameter);
             rtlsdr_set_xtal_freq(dev->rtl_dev, 0, cmd->parameter);
             break;
         case TCP_SET_TUNER_GAIN_BY_ID:
@@ -163,7 +164,7 @@ void tcpCommandCallback(sdrtcp_t * tcpserv, void * pointer, sdr_tcp_command_t * 
             sdrtcp_stop_serving_client(tcpserv);
             break;
         case TCP_ANDROID_GAIN_BY_PERCENTAGE:
-            LOGI("set gain by percentage %ld", cmd->parameter);
+            LOGI("set gain by percentage %u", (unsigned) cmd->parameter);
             set_gain_by_perc(dev->rtl_dev, cmd->parameter);
             break;
         default:
@@ -261,9 +262,16 @@ Java_com_sdrtouch_rtlsdr_driver_RtlSdrDevice_openAsync(
     }
     LOGI("rtlsdr_read_async finished successfully");
 
+    /* ★ 顺序必须是"先停服务、等它退出，再置 NULL、再 close 设备"：
+     *   命令回调跑在 sdrtcp 的命令线程上，它会用 dev->rtl_dev 调 librtlsdr。
+     *   原来先 rtlsdr_close(device) 再停服务 —— 命令线程恰好在这个窗口里
+     *   拿着已经释放的 rtlsdr_dev_t 调 rtlsdr_set_*，就是 use-after-free
+     *   （USB 掉线/快速重连时随机崩）。 */
+    sdrtcp_stop_serving_client(&dev->tcpserv);
+    for (int i = 0; i < 250 && !dev->tcpserv.worker_done; i++)
+        usleep(10 * 1000);
     dev->rtl_dev = NULL;
     rtlsdr_close(device);
-    sdrtcp_stop_serving_client(&dev->tcpserv);
 
     (*env)->ReleaseStringUTFChars(env, address_, address);
     (*env)->ReleaseStringUTFChars(env, devicePath_, devicePath);

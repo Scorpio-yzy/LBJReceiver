@@ -6,7 +6,7 @@ ADD_SUBDIRECTORY(librtlsdr)
 
 FILE ( GLOB_RECURSE SOURCES_LIB "src/*.c" )
 
-SET ( CMAKE_C_FLAGS         "-Wall" )
+SET ( CMAKE_C_FLAGS         "${CMAKE_C_FLAGS} -Wall" )   # ★ 追加而不是覆盖：覆盖会丢掉 toolchain 默认的加固 flags（-fstack-protector 等）
 SET ( CMAKE_C_FLAGS_DEBUG   "-g -DDEBUG")
 SET ( CMAKE_C_FLAGS_RELEASE "-O1 -DNDEBUG" ) # Keep optimization low to reduce random libusb crashes
 
