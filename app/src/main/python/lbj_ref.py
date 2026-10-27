@@ -12,6 +12,13 @@
 #   本文件是 https://github.com/Sdr-Is-Fun/RTL_SDR_LBJ_RECEIVER 的
 #   rtl_sdr_lbj_receiver.py 原文照搬（68,891 字节，逐字节相同），仅改名为 lbj_ref.py。
 #   除上面这段说明外，正文与上游完全一致；要改正文请连同改动说明写在这里。
+#
+#   ★ 正文改动（本项目）：
+#     1) _u5() 改为调用 lbj_prefix.category_for()。原文件里"车次字头 -> 列车类别"是一张
+#        硬编码表（K/T/Z/G/D/C/X/Y）；2026-10 国铁车次编排改革后语义变了（T=300km/h 动车组、
+#        K=200~250 动车组、X=350+ 复兴号、货物班列改 B…）并新增 N/V/B/S，硬编码表会把新车次
+#        误判成"普通旅客列车"。判定移到独立纯模块，便于桌面单测（python lbj_prefix.py）。
+#     2) import lbj_prefix（紧跟在原有 import 之后）。
 # ---------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -21,6 +28,7 @@ import numpy as np
 from numpy.typing import NDArray
 import scipy.signal as ssig
 from scipy.signal import firwin, lfilter, lfilter_zi
+import lbj_prefix            # ★ 本项目改动：车次字头/号段 -> 列车类别（见文件头说明）
 if os.name == 'nt':
     os.system('')
 BASEBAND_RATE = 48000
@@ -105,6 +113,20 @@ def _u4():
     return None
 
 def _u5(train_no, is_detailed):
+    """车次 -> 列车类别/等级。
+
+    ★ 本项目改动：改成调 lbj_prefix.category_for()（独立纯模块、可按两批生效日区分新旧字头、
+      自带自测）。原硬编码表在 2026 年车次编排改革后会把 N/V/B/S 与"语义已变"的 T/K/X/D/Z/Y
+      判错（例如把货物班列 B 判成普通旅客列车）。
+    """
+    try:
+        return lbj_prefix.category_for(train_no, bool(is_detailed))
+    except Exception as e:
+        print('LBJ-ERR 车次类别判定失败: %s' % e, flush=True)
+        return '未知类别'
+
+def _u5_legacy(train_no, is_detailed):
+    """（保留原实现作对照/兜底，正常不再调用）"""
     if not train_no or train_no in ('等待信号...', '----'):
         return '等待信号...'
     tn = train_no.replace(' ', '').strip().upper()
