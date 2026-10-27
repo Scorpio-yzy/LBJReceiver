@@ -47,6 +47,7 @@ PHASE2 = {
     'S': '160km/h 及以下市域旅客列车',
     'Z': '160km/h 快速旅客列车',
     'N': '140km/h 快速旅客列车',
+    'V': '120km/h 普速旅客列车',
     'Y': '普速旅游列车',
     'B': '货物班列',
 }
@@ -106,6 +107,45 @@ def _y_category(n):
     return PHASE2['Y']
 
 
+def _legacy_category(train_no, is_detailed):
+    """旧规则判定（逐条照抄原 lbj_ref._u5）。
+
+    只用于测试：证明"改革实施前（now < PHASE2_START）本模块对旧车次的判定与旧版完全相同"，
+    避免"为了支持新字头而偷偷改了旧行为"。
+    """
+    if not train_no or train_no in ('等待信号...', '----'):
+        return '等待信号...'
+    tn = str(train_no).replace(' ', '').strip().upper()
+    for p, c in [('K', '快速旅客列车'), ('Z', '直达特快列车'), ('T', '特快旅客列车'),
+                 ('G', '高速动车组'), ('D', '动车组列车'), ('C', '城际动车组'),
+                 ('X', '行包货物列车'), ('Y', '旅游旅客列车')]:
+        if tn.startswith(p):
+            return c
+    if tn.startswith('00'):
+        d = ''.join(filter(str.isdigit, tn))
+        if d:
+            n = int(d)
+            if 1 <= n <= 100:
+                return '动车组有火回送'
+            if 101 <= n <= 198:
+                return '动车组无火跨局回送'
+            if 201 <= n <= 298:
+                return '动车组无火管内回送'
+            if 301 <= n <= 398:
+                return '跨局回送客车'
+            if 401 <= n <= 498:
+                return '管内回送客车'
+    d = ''.join(filter(str.isdigit, tn))
+    if d:
+        n = int(d)
+        for lo, hi, cat in _FREIGHT_RANGES:
+            if lo <= n <= hi:
+                return cat
+        if 1 <= n <= 9998:
+            return '普通旅客列车' if is_detailed else '等待详细报文确认...'
+    return '未知类别'
+
+
 def category_for(train_no, is_detailed=True, now=None):
     """车次 -> 类别的可读文字。规则见模块注释。
 
@@ -139,8 +179,15 @@ def category_for(train_no, is_detailed=True, now=None):
             return table[head]
         if head in _ALWAYS:
             return PHASE2[head]
-        # 未知字母（将来又改规则）：给一个不误导的说法，别硬套成"普通旅客列车"
-        return '未知字头(%s)列车' % head
+        # 未知字母：
+        #   · 第二批（新规则）之后：给"未知字头(X)列车"，别硬套成"普通旅客列车"（误导）；
+        #   · 第二批之前（也就是现在）：【落下去按数字号段判】，与旧实现完全一致 ——
+        #     旧代码本来就没有 L（临时旅客）/A/Q/… 这些字头，显示的是"普通旅客列车"，
+        #     这里不擅自改变用户现在看到的结果（等价性回归用例会检查这一点）。
+        if not phase2:
+            pass
+        else:
+            return '未知字头(%s)列车' % head
 
     # 00 开头：回送车次（与改革无关）
     if tn.startswith('00') and n is not None:
@@ -194,6 +241,7 @@ if __name__ == '__main__':
         ('1234', True, NEW, '普通旅客列车'),
         ('10501', True, NEW, '技术直达货运列车'),
         ('A12', True, NEW, '未知字头(A)列车'),
+        ('V', True, NEW, '120km/h 普速旅客列车'),        # 只有字母没有数字（曾经 KeyError）
     ]
     bad = 0
     for train, detailed, now, want in cases:
@@ -202,5 +250,33 @@ if __name__ == '__main__':
         bad += 0 if ok else 1
         print('%s %-8s %-10s -> %-28s (期望 %s)' % ('OK ' if ok else 'BAD', train,
               '新规则' if now >= PHASE2_START else '旧规则', got, want))
-    print('\n%d/%d 通过' % (len(cases) - bad, len(cases)))
+
+    # ★ 等价性回归：改革实施前（旧日期），对旧车次的判定必须与旧实现逐条相同。
+    #   这条是"支持新字头不会改坏旧解析"的硬证据。
+    legacy_cases = [
+        ('G1', True), ('G8001', False), ('D2287', True), ('C2001', True),
+        ('T358', True), ('K123', True), ('Z12', True), ('X105', True), ('Y101', True),
+        ('1234', True), ('1234', False), ('7', True),
+        ('0101', True), ('00201', True), ('00301', True), ('00401', True), ('00801', True),
+        ('10501', True), ('20001', True), ('40001', True), ('50001', True),
+        ('58101', True), ('80001', True), ('90001', True), ('93001', True),
+        ('99999', True), ('', True), ('----', True),
+        ('L123', True), ('A12', True), ('Q1', True), ('F1', True),
+    ]
+    print('\n--- 旧规则等价性（now=2026-10-27，与旧实现逐条对比）---')
+    for train, detailed in legacy_cases:
+        got = category_for(train, detailed, _dt.datetime(2026, 10, 27))
+        want = _legacy_category(train, detailed)
+        ok = (got == want)
+        bad += 0 if ok else 1
+        print('%s %-8s -> %-26s (旧实现 %s)' % ('OK ' if ok else 'BAD', train or '(空)', got, want))
+
+    # 有意的差异（不是回归）：N/V/B/S 是第一批就生效的新字头，改革实施前理论上收不到；
+    # 万一收到（试运行/测试），显示新含义比旧版的"普通旅客列车"更准确。
+    print('\n--- 有意的差异（新字头，旧日期下也按新含义）---')
+    for train in ('N123', 'V100', 'B80001', 'S101'):
+        print('  %-8s -> %s  (旧实现会显示「普通旅客列车」)' % (train, category_for(train, True, _dt.datetime(2026, 10, 27))))
+
+    print('\n%d 项全部通过' % (len(cases) + len(legacy_cases)) if bad == 0
+          else '\n%d 项失败' % bad)
     raise SystemExit(1 if bad else 0)
